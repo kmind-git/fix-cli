@@ -18,7 +18,7 @@
 
 ## 当前锁文件实测
 
-- 解析后的依赖节点：87。
+- `Cargo.lock` 包条目：87；当前离线 `cargo metadata` 实际解析节点：85。
 - denylist 命中：0。
 - 不存在 `quickfix`、`cxx`、`bindgen`、OpenSSL、AWS-LC、ring、SQLite、`cc`、CMake、pkg-config、vcpkg 或 libFuzzer。
 - 含 build.rs 的解析包：`generic-array`、`libc`、`num-traits`、`proc-macro2`、`quote`、`redb`、`ref-cast`、`rust_decimal`、`rustversion`、`serde`、`serde_core`、`serde_json`、`thiserror`、`wasm-bindgen`、`wasm-bindgen-shared`、`zmij`。
@@ -192,7 +192,7 @@ libfuzzer-sys
 
 ## 7. 已验证与后续复核
 
-当前已固定 `rust-toolchain.toml` 与 `Cargo.lock`，并在 Windows MSVC 上执行 workspace all-target check/test、clippy（最终提交前执行）、本地 named pipe、TCP 重连、redb reopen 和进程级 E2E。锁文件 denylist 与 build.rs 扫描结果见上文。
+当前已固定 `rust-toolchain.toml` 与 `Cargo.lock`，并在 Windows MSVC 上执行 workspace all-target check/test、clippy（最终提交前执行）、本地 named pipe、TCP 重连和 redb reopen；进程级 `fix-mock` + `fixd` + `fixctl` 仅作为本次开发的人工 smoke 执行，尚未提交自动 child-process 测试。锁文件 denylist 与 build.rs 扫描结果见上文。
 
 仍需：
 

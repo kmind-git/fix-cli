@@ -303,6 +303,205 @@ async fn a_high_sequence_is_buffered_then_drained_after_a_gap_fill() {
 }
 
 #[tokio::test]
+async fn a_gap_fill_discards_buffered_sequences_below_new_seq_no() {
+    let (client, mut server) = duplex(8192);
+    let handle = spawn_initiator(
+        client,
+        SessionConfig {
+            begin_string: "FIX.4.4".to_owned(),
+            sender_comp_id: "CLIENT".to_owned(),
+            target_comp_id: "SERVER".to_owned(),
+            heartbeat_interval_secs: 30,
+            default_appl_ver_id: None,
+        },
+        StoreWorker::spawn(MemoryStore::new(b"audit-test-key")),
+        Arc::new(StaticTimeSource::new("20260726-15:00:00.000")),
+    );
+    let mut outbound = vec![0_u8; 8192];
+    timeout(Duration::from_secs(1), server.read(&mut outbound))
+        .await
+        .expect("outbound Logon timeout")
+        .expect("read outbound Logon");
+    let logon = encode_message(
+        b"FIX.4.4",
+        &[
+            Field::new(35, Bytes::from_static(b"A")),
+            Field::new(49, Bytes::from_static(b"SERVER")),
+            Field::new(56, Bytes::from_static(b"CLIENT")),
+            Field::new(34, Bytes::from_static(b"1")),
+            Field::new(52, Bytes::from_static(b"20260726-15:00:00.000")),
+            Field::new(98, Bytes::from_static(b"0")),
+            Field::new(108, Bytes::from_static(b"30")),
+        ],
+    )
+    .expect("server Logon");
+    server.write_all(&logon).await.expect("write Logon");
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if handle.status().await.expect("status").phase == SessionPhase::Established {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("establish timeout");
+
+    let stale = encode_message(
+        b"FIX.4.4",
+        &[
+            Field::new(35, Bytes::from_static(b"0")),
+            Field::new(49, Bytes::from_static(b"SERVER")),
+            Field::new(56, Bytes::from_static(b"CLIENT")),
+            Field::new(34, Bytes::from_static(b"3")),
+            Field::new(52, Bytes::from_static(b"20260726-15:00:01.000")),
+        ],
+    )
+    .expect("out-of-order Heartbeat");
+    server.write_all(&stale).await.expect("write stale message");
+    timeout(Duration::from_secs(1), server.read(&mut outbound))
+        .await
+        .expect("ResendRequest timeout")
+        .expect("read ResendRequest");
+
+    let gap_fill = encode_message(
+        b"FIX.4.4",
+        &[
+            Field::new(35, Bytes::from_static(b"4")),
+            Field::new(49, Bytes::from_static(b"SERVER")),
+            Field::new(56, Bytes::from_static(b"CLIENT")),
+            Field::new(34, Bytes::from_static(b"2")),
+            Field::new(52, Bytes::from_static(b"20260726-15:00:02.000")),
+            Field::new(123, Bytes::from_static(b"Y")),
+            Field::new(36, Bytes::from_static(b"4")),
+        ],
+    )
+    .expect("GapFill");
+    server.write_all(&gap_fill).await.expect("write GapFill");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let status = handle.status().await.expect("status");
+            if status.phase == SessionPhase::Established && status.next_in == 4 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("stale buffered sequence must be discarded");
+}
+
+#[tokio::test]
+async fn a_buffered_gap_fill_discards_messages_it_skips_during_drain() {
+    let (client, mut server) = duplex(8192);
+    let handle = spawn_initiator(
+        client,
+        SessionConfig {
+            begin_string: "FIX.4.4".to_owned(),
+            sender_comp_id: "CLIENT".to_owned(),
+            target_comp_id: "SERVER".to_owned(),
+            heartbeat_interval_secs: 30,
+            default_appl_ver_id: None,
+        },
+        StoreWorker::spawn(MemoryStore::new(b"audit-test-key")),
+        Arc::new(StaticTimeSource::new("20260726-15:00:00.000")),
+    );
+    let mut outbound = vec![0_u8; 8192];
+    timeout(Duration::from_secs(1), server.read(&mut outbound))
+        .await
+        .expect("outbound Logon timeout")
+        .expect("read outbound Logon");
+    let logon = encode_message(
+        b"FIX.4.4",
+        &[
+            Field::new(35, Bytes::from_static(b"A")),
+            Field::new(49, Bytes::from_static(b"SERVER")),
+            Field::new(56, Bytes::from_static(b"CLIENT")),
+            Field::new(34, Bytes::from_static(b"1")),
+            Field::new(52, Bytes::from_static(b"20260726-15:00:00.000")),
+            Field::new(98, Bytes::from_static(b"0")),
+            Field::new(108, Bytes::from_static(b"30")),
+        ],
+    )
+    .expect("server Logon");
+    server.write_all(&logon).await.expect("write Logon");
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if handle.status().await.expect("status").phase == SessionPhase::Established {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("establish timeout");
+
+    let skipped = encode_message(
+        b"FIX.4.4",
+        &[
+            Field::new(35, Bytes::from_static(b"0")),
+            Field::new(49, Bytes::from_static(b"SERVER")),
+            Field::new(56, Bytes::from_static(b"CLIENT")),
+            Field::new(34, Bytes::from_static(b"4")),
+            Field::new(52, Bytes::from_static(b"20260726-15:00:03.000")),
+        ],
+    )
+    .expect("sequence 4 Heartbeat");
+    server.write_all(&skipped).await.expect("write sequence 4");
+    timeout(Duration::from_secs(1), server.read(&mut outbound))
+        .await
+        .expect("ResendRequest timeout")
+        .expect("read ResendRequest");
+
+    let buffered_gap_fill = encode_message(
+        b"FIX.4.4",
+        &[
+            Field::new(35, Bytes::from_static(b"4")),
+            Field::new(49, Bytes::from_static(b"SERVER")),
+            Field::new(56, Bytes::from_static(b"CLIENT")),
+            Field::new(34, Bytes::from_static(b"3")),
+            Field::new(52, Bytes::from_static(b"20260726-15:00:02.000")),
+            Field::new(123, Bytes::from_static(b"Y")),
+            Field::new(36, Bytes::from_static(b"5")),
+        ],
+    )
+    .expect("buffered GapFill");
+    server
+        .write_all(&buffered_gap_fill)
+        .await
+        .expect("write buffered GapFill");
+
+    let sequence_two = encode_message(
+        b"FIX.4.4",
+        &[
+            Field::new(35, Bytes::from_static(b"0")),
+            Field::new(49, Bytes::from_static(b"SERVER")),
+            Field::new(56, Bytes::from_static(b"CLIENT")),
+            Field::new(34, Bytes::from_static(b"2")),
+            Field::new(52, Bytes::from_static(b"20260726-15:00:01.000")),
+        ],
+    )
+    .expect("sequence 2 Heartbeat");
+    server
+        .write_all(&sequence_two)
+        .await
+        .expect("write sequence 2");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let status = handle.status().await.expect("status");
+            if status.phase == SessionPhase::Established && status.next_in == 5 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("buffered GapFill must remove skipped buffered messages");
+}
+
+#[tokio::test]
 async fn a_low_sequence_possdup_is_verified_against_the_committed_original() {
     let (client, mut server) = duplex(8192);
     let store = StoreWorker::spawn(MemoryStore::new(b"audit-test-key"));

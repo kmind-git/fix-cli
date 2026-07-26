@@ -280,6 +280,22 @@ pub enum ValidationError {
     #[error("NumInGroup tag {tag} is not an unsigned decimal")]
     InvalidGroupCount { tag: u32 },
     #[error(
+        "NumInGroup tag {tag} declares {count} entries, above the implementation limit {maximum}"
+    )]
+    GroupCountLimitExceeded {
+        tag: u32,
+        count: usize,
+        maximum: usize,
+    },
+    #[error(
+        "NumInGroup tag {tag} declares {count} entries but only {remaining_fields} fields remain"
+    )]
+    GroupCountExceedsRemainingFields {
+        tag: u32,
+        count: usize,
+        remaining_fields: usize,
+    },
+    #[error(
         "group {count_tag} entry {entry} must start with delimiter {delimiter_tag}, got {actual:?}"
     )]
     MissingGroupDelimiter {
@@ -331,7 +347,31 @@ fn parse_layout(
                     .map_err(|_| ValidationError::InvalidGroupCount { tag: *count_tag })?;
                 *cursor += 1;
 
-                let mut entries = Vec::with_capacity(count);
+                const MAX_REPEATING_GROUP_ENTRIES: usize = 65_536;
+                if count > MAX_REPEATING_GROUP_ENTRIES {
+                    return Err(ValidationError::GroupCountLimitExceeded {
+                        tag: *count_tag,
+                        count,
+                        maximum: MAX_REPEATING_GROUP_ENTRIES,
+                    });
+                }
+                let remaining_fields = fields.len().saturating_sub(*cursor);
+                if count > remaining_fields {
+                    return Err(ValidationError::GroupCountExceedsRemainingFields {
+                        tag: *count_tag,
+                        count,
+                        remaining_fields,
+                    });
+                }
+
+                let mut entries = Vec::new();
+                entries.try_reserve(count).map_err(|_| {
+                    ValidationError::GroupCountLimitExceeded {
+                        tag: *count_tag,
+                        count,
+                        maximum: MAX_REPEATING_GROUP_ENTRIES,
+                    }
+                })?;
                 for entry_index in 0..count {
                     let actual = fields.get(*cursor).map(|field| field.tag);
                     if actual != Some(*delimiter_tag) {

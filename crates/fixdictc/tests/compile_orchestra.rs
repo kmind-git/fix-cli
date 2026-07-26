@@ -1,5 +1,5 @@
 use fix_protocol::{Item, ParseDictionary, encode_message, parse_frame};
-use fixdictc::compile_orchestra;
+use fixdictc::{CompileError, compile_orchestra};
 
 const ORCHESTRA: &str = r#"
 <fixr:repository xmlns:fixr="http://fixprotocol.io/2020/orchestra/repository">
@@ -89,4 +89,28 @@ fn compiler_derives_the_data_length_pair_from_orchestra_length_id() {
     let message = dictionary.validate(parsed).expect("dictionary validation");
 
     assert_eq!(message.raw.values(96).next(), Some(b"A\x01B".as_slice()));
+}
+
+#[test]
+fn compiler_rejects_duplicate_message_types() {
+    const DUPLICATE_MESSAGE_TYPE: &str = r#"
+<fixr:repository xmlns:fixr="http://fixprotocol.io/2023/orchestra/repository">
+  <fixr:fields>
+    <fixr:field id="35" name="MsgType" type="String"/>
+  </fixr:fields>
+  <fixr:messages>
+    <fixr:message name="First" msgType="U1"><fixr:structure/></fixr:message>
+    <fixr:message name="Second" msgType="U1"><fixr:structure/></fixr:message>
+  </fixr:messages>
+</fixr:repository>
+"#;
+
+    let error = compile_orchestra(DUPLICATE_MESSAGE_TYPE.as_bytes(), "FIX.4.4")
+        .expect_err("duplicate MsgType must fail closed");
+
+    assert!(matches!(
+        error,
+        CompileError::DuplicateDefinition(ref value)
+            if value == "message MsgType U1"
+    ));
 }

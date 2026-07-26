@@ -6,11 +6,12 @@ use fix_protocol::{
     parse_frame,
 };
 use fix_store::{
-    AuditEvent, CommandRecord, EventRecord, InboundCommit, MarkOutboundWritten, OutboundCommit,
-    OutboundRange, StoreHandle, StoreOp, StoreReply,
+    AuditEvent, CommandRecord, EventRecord, InboundCommit, MarkOutboundWritten,
+    MarkTransmissionWritten, OutboundCommit, OutboundRange, StoreHandle, StoreOp, StoreReply,
+    TransmissionCommit,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -55,6 +56,24 @@ pub struct ApplicationRequest {
     pub cl_ord_id: String,
     pub msg_type: String,
     pub fields: Vec<Field>,
+}
+
+pub fn validate_custom_logon_fields(fields: &[Field]) -> Result<(), SessionError> {
+    let mut custom_tags = BTreeSet::new();
+    for field in fields {
+        if matches!(
+            field.tag,
+            0 | 8 | 9 | 10 | 34 | 35 | 43 | 49 | 52 | 56 | 98 | 108 | 1137 | 122
+        ) || field.value.contains(&0x01)
+            || !custom_tags.insert(field.tag)
+        {
+            return Err(SessionError::Protocol(format!(
+                "invalid custom Logon field {}",
+                field.tag
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub trait TimeSource: Send + Sync + 'static {
@@ -127,12 +146,15 @@ pub enum SessionError {
 
 enum ActorCommand {
     Status,
+    LookupCommand(String),
     Submit(ApplicationRequest),
     Logout(Option<String>),
 }
 
+#[derive(Clone)]
 enum ActorReply {
     Status(SessionStatus),
+    StoredCommand(Option<CommandRecord>),
     Command(CommandRecord),
     Ack,
 }
@@ -161,7 +183,9 @@ impl SessionHandle {
 
         match reply_rx.await.map_err(|_| SessionError::ActorStopped)?? {
             ActorReply::Status(status) => Ok(status),
-            ActorReply::Command(_) | ActorReply::Ack => Err(SessionError::ActorStopped),
+            ActorReply::StoredCommand(_) | ActorReply::Command(_) | ActorReply::Ack => {
+                Err(SessionError::ActorStopped)
+            }
         }
     }
 
@@ -180,7 +204,30 @@ impl SessionHandle {
             .map_err(|_| SessionError::ActorStopped)?;
         match reply_rx.await.map_err(|_| SessionError::ActorStopped)?? {
             ActorReply::Ack => Ok(()),
-            ActorReply::Status(_) | ActorReply::Command(_) => Err(SessionError::ActorStopped),
+            ActorReply::Status(_) | ActorReply::StoredCommand(_) | ActorReply::Command(_) => {
+                Err(SessionError::ActorStopped)
+            }
+        }
+    }
+
+    pub async fn lookup_command(
+        &self,
+        request_id: impl Into<String>,
+    ) -> Result<Option<CommandRecord>, SessionError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands
+            .send(Envelope {
+                command: ActorCommand::LookupCommand(request_id.into()),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| SessionError::ActorStopped)?;
+
+        match reply_rx.await.map_err(|_| SessionError::ActorStopped)?? {
+            ActorReply::StoredCommand(command) => Ok(command),
+            ActorReply::Status(_) | ActorReply::Command(_) | ActorReply::Ack => {
+                Err(SessionError::ActorStopped)
+            }
         }
     }
 
@@ -196,7 +243,9 @@ impl SessionHandle {
 
         match reply_rx.await.map_err(|_| SessionError::ActorStopped)?? {
             ActorReply::Command(command) => Ok(command),
-            ActorReply::Status(_) | ActorReply::Ack => Err(SessionError::ActorStopped),
+            ActorReply::Status(_) | ActorReply::StoredCommand(_) | ActorReply::Ack => {
+                Err(SessionError::ActorStopped)
+            }
         }
     }
 }
@@ -360,7 +409,7 @@ where
                     let Some(command) = command else {
                         return Ok(());
                     };
-                    self.handle_command(command).await;
+                    self.handle_command(command).await?;
                 }
                 read = reader.read(&mut input) => {
                     let count = read.map_err(|error| SessionError::Transport(error.to_string()))?;
@@ -400,7 +449,7 @@ where
         }
     }
 
-    async fn handle_command(&mut self, envelope: Envelope) {
+    async fn handle_command(&mut self, envelope: Envelope) -> Result<(), SessionError> {
         let result = match envelope.command {
             ActorCommand::Status => Ok(ActorReply::Status(SessionStatus {
                 phase: self.phase,
@@ -411,30 +460,44 @@ where
                     .as_ref()
                     .map(|outstanding| outstanding.id.clone()),
             })),
+            ActorCommand::LookupCommand(request_id) => self
+                .load_command(request_id)
+                .await
+                .map(ActorReply::StoredCommand),
             ActorCommand::Submit(request) => self
                 .submit_application(request)
                 .await
                 .map(ActorReply::Command),
             ActorCommand::Logout(text) => self.send_logout(text).await.map(|()| ActorReply::Ack),
         };
+        let fatal_error = result
+            .as_ref()
+            .err()
+            .filter(|error| error.is_fatal())
+            .cloned();
         let _ = envelope.reply.send(result);
+        fatal_error.map_or(Ok(()), Err)
+    }
+
+    async fn load_command(
+        &mut self,
+        request_id: String,
+    ) -> Result<Option<CommandRecord>, SessionError> {
+        let reply = self
+            .store
+            .apply(StoreOp::LoadCommand(request_id))
+            .await
+            .map_err(|error| SessionError::Store(error.to_string()))?;
+        let StoreReply::StoredCommand(command) = reply else {
+            return Err(SessionError::Store(
+                "command lookup returned the wrong record type".to_owned(),
+            ));
+        };
+        Ok(command)
     }
 
     async fn send_logon(&mut self) -> Result<(), SessionError> {
-        let mut custom_tags = std::collections::BTreeSet::new();
-        for field in &self.logon_fields {
-            if matches!(
-                field.tag,
-                0 | 8 | 9 | 10 | 34 | 35 | 43 | 49 | 52 | 56 | 98 | 108 | 1137 | 122
-            ) || field.value.contains(&0x01)
-                || !custom_tags.insert(field.tag)
-            {
-                return Err(SessionError::Protocol(format!(
-                    "invalid custom Logon field {}",
-                    field.tag
-                )));
-            }
-        }
+        validate_custom_logon_fields(&self.logon_fields)?;
         let mut fields = self.standard_header("A");
         fields.push(Field::new(98, Bytes::from_static(b"0")));
         fields.push(Field::new(
@@ -453,12 +516,7 @@ where
         let journal_fields = fields
             .iter()
             .map(|field| {
-                if matches!(field.tag, 553 | 554 | 925)
-                    || self
-                        .dictionary
-                        .as_ref()
-                        .is_some_and(|dictionary| dictionary.sensitive_tags.contains(&field.tag))
-                {
+                if self.is_sensitive_tag(field.tag) {
                     Field::new(field.tag, Bytes::from_static(b"<redacted>"))
                 } else {
                     field.clone()
@@ -544,7 +602,12 @@ where
         }
 
         self.commit_expected(message, frame).await?;
-        while let Some(buffered) = self.gap_buffer.remove(&self.next_in) {
+        loop {
+            self.gap_buffer
+                .retain(|sequence, _| *sequence >= self.next_in);
+            let Some(buffered) = self.gap_buffer.remove(&self.next_in) else {
+                break;
+            };
             let message = self.parse_inbound(&buffered)?;
             self.commit_expected(message, &buffered).await?;
         }
@@ -617,6 +680,16 @@ where
                 "inbound TargetCompID does not match SenderCompID".to_owned(),
             ));
         }
+        if let Some(field) = message
+            .fields
+            .iter()
+            .find(|field| self.is_sensitive_tag(field.tag))
+        {
+            return Err(SessionError::Protocol(format!(
+                "inbound sensitive tag {} is forbidden from persistent session input",
+                field.tag
+            )));
+        }
         if let Some(dictionary) = &self.dictionary {
             dictionary
                 .validate(message.clone())
@@ -643,16 +716,29 @@ where
         let msg_type = std::str::from_utf8(msg_type)
             .map_err(|_| SessionError::Protocol("MsgType is not ASCII".to_owned()))?
             .to_owned();
-        let requested_resend = if msg_type == "2" {
-            Some((required_u64(&message, 7)?, required_u64(&message, 16)?))
-        } else {
-            None
-        };
+        let requested_resend =
+            if msg_type == "2" {
+                Some(self.validate_replay_range(
+                    required_u64(&message, 7)?,
+                    required_u64(&message, 16)?,
+                )?)
+            } else {
+                None
+            };
         let heartbeat_response = if msg_type == "1" {
             Some(required_value(&message, 112)?.to_vec())
         } else {
             None
         };
+        if msg_type == "A" {
+            let heartbeat = required_u64(&message, 108)?;
+            if heartbeat != self.config.heartbeat_interval_secs {
+                return Err(SessionError::Protocol(format!(
+                    "peer HeartBtInt {heartbeat} does not match configured {}",
+                    self.config.heartbeat_interval_secs
+                )));
+            }
+        }
         let next_in_after = if msg_type == "4" {
             if required_value(&message, 123)? != b"Y" {
                 return Err(SessionError::Protocol(
@@ -698,17 +784,8 @@ where
         self.next_in = next_in_after;
         self.next_event += 1;
 
-        if msg_type == "A" {
-            let heartbeat = required_u64(&message, 108)?;
-            if heartbeat != self.config.heartbeat_interval_secs {
-                return Err(SessionError::Protocol(format!(
-                    "peer HeartBtInt {heartbeat} does not match configured {}",
-                    self.config.heartbeat_interval_secs
-                )));
-            }
-            if self.phase == SessionPhase::LogonSent {
-                self.set_phase(SessionPhase::Established);
-            }
+        if msg_type == "A" && self.phase == SessionPhase::LogonSent {
+            self.set_phase(SessionPhase::Established);
         }
         if msg_type == "0"
             && let (Some(outstanding), Some(test_req_id)) =
@@ -724,7 +801,7 @@ where
             self.set_phase(SessionPhase::Disconnected);
         }
         if let Some((begin, end)) = requested_resend {
-            self.replay_range(begin, end).await?;
+            self.replay_validated_range(begin, end).await?;
         }
         if let Some(test_request_id) = heartbeat_response {
             self.send_heartbeat_response(Some(&test_request_id)).await?;
@@ -1039,10 +1116,7 @@ where
                 | SessionPhase::Established
                 | SessionPhase::Recovering
         ) {
-            return Err(SessionError::Protocol(format!(
-                "cannot send Logout while session is {:?}",
-                self.phase
-            )));
+            return Err(SessionError::NotEstablished);
         }
         let mut fields = self.standard_header("5");
         if let Some(text) = text {
@@ -1098,11 +1172,11 @@ where
         Ok(())
     }
 
-    async fn replay_range(
-        &mut self,
+    fn validate_replay_range(
+        &self,
         begin_seq_num: u64,
         requested_end_seq_num: u64,
-    ) -> Result<(), SessionError> {
+    ) -> Result<(u64, u64), SessionError> {
         let end_seq_num = if requested_end_seq_num == 0 {
             self.next_out.saturating_sub(1)
         } else {
@@ -1113,7 +1187,14 @@ where
                 "invalid ResendRequest range {begin_seq_num}..={requested_end_seq_num}"
             )));
         }
+        Ok((begin_seq_num, end_seq_num))
+    }
 
+    async fn replay_validated_range(
+        &mut self,
+        begin_seq_num: u64,
+        end_seq_num: u64,
+    ) -> Result<(), SessionError> {
         let reply = self
             .store
             .apply(StoreOp::LoadOutboundRange(OutboundRange {
@@ -1156,6 +1237,7 @@ where
     async fn write_application_replay(&mut self, wire: &[u8]) -> Result<(), SessionError> {
         let original = parse_frame(wire, &ParseDictionary::new())
             .map_err(|error| SessionError::Codec(error.to_string()))?;
+        let msg_seq_num = required_u64(&original, 34)?;
         let original_sending_time = required_value(&original, 52)?.to_vec();
         let mut replay_fields = Vec::with_capacity(original.fields.len() + 2);
         for field in original.fields {
@@ -1174,16 +1256,8 @@ where
             }
         }
         let replay = self.encode_outbound(&replay_fields)?;
-        self.writer
-            .write_all(&replay)
+        self.write_replay_transmission(msg_seq_num, "application_replay", replay)
             .await
-            .map_err(|error| SessionError::Transport(error.to_string()))?;
-        self.writer
-            .flush()
-            .await
-            .map_err(|error| SessionError::Transport(error.to_string()))?;
-        self.last_outbound = Instant::now();
-        Ok(())
     }
 
     async fn write_gap_fill(
@@ -1210,6 +1284,35 @@ where
             Field::new(36, Bytes::from(new_seq_num.to_string())),
         ];
         let wire = self.encode_outbound(&fields)?;
+        self.write_replay_transmission(gap_start, "gap_fill", wire)
+            .await
+    }
+
+    async fn write_replay_transmission(
+        &mut self,
+        msg_seq_num: u64,
+        kind: &str,
+        wire: Bytes,
+    ) -> Result<(), SessionError> {
+        let reply = self
+            .store
+            .apply(StoreOp::CommitTransmission(TransmissionCommit {
+                msg_seq_num,
+                kind: kind.to_owned(),
+                wire: wire.to_vec(),
+                audit: AuditEvent {
+                    kind: format!("{kind}_journaled"),
+                    details: BTreeMap::from([("msg_seq_num".to_owned(), msg_seq_num.to_string())]),
+                },
+            }))
+            .await
+            .map_err(|error| SessionError::Store(error.to_string()))?;
+        let StoreReply::Transmission(transmission) = reply else {
+            return Err(SessionError::Store(
+                "transmission commit returned the wrong record type".to_owned(),
+            ));
+        };
+
         self.writer
             .write_all(&wire)
             .await
@@ -1219,6 +1322,16 @@ where
             .await
             .map_err(|error| SessionError::Transport(error.to_string()))?;
         self.last_outbound = Instant::now();
+        self.store
+            .apply(StoreOp::MarkTransmissionWritten(MarkTransmissionWritten {
+                id: transmission.id,
+                audit: AuditEvent {
+                    kind: format!("{kind}_written"),
+                    details: BTreeMap::from([("msg_seq_num".to_owned(), msg_seq_num.to_string())]),
+                },
+            }))
+            .await
+            .map_err(|error| SessionError::Store(error.to_string()))?;
         Ok(())
     }
 
@@ -1251,9 +1364,27 @@ where
         Ok(wire)
     }
 
+    fn is_sensitive_tag(&self, tag: u32) -> bool {
+        matches!(tag, 553 | 554 | 925)
+            || self.logon_fields.iter().any(|field| field.tag == tag)
+            || self
+                .dictionary
+                .as_ref()
+                .is_some_and(|dictionary| dictionary.sensitive_tags.contains(&tag))
+    }
+
     fn set_phase(&mut self, phase: SessionPhase) {
         self.phase = phase;
         let _ = self.events.send(SessionEvent::PhaseChanged(phase));
+    }
+}
+
+impl SessionError {
+    fn is_fatal(&self) -> bool {
+        matches!(
+            self,
+            Self::Store(_) | Self::Codec(_) | Self::Transport(_) | Self::Protocol(_)
+        )
     }
 }
 

@@ -77,7 +77,7 @@ Established → LogoutSent → Disconnected
 - 高序号：最多缓存 1,024 条并发送 `ResendRequest(next_in, 0)`。
 - `SequenceReset(4)`：只接受 `GapFillFlag=Y` 且 `NewSeqNo > next_in`；普通 reset 被禁。
 - 低序号：必须 `PossDupFlag=Y`、单一 OrigSendingTime；从 store 加载原始序号，比较原始 SendingTime 和去除 43/52/122 后的完整 payload。不存在原文或 payload 变化即 Blocked。
-- 对端 ResendRequest：application 原序号重发，设置 `43=Y`、新 52、原 52 写入 122；admin/缺失区间合并成 GapFill。
+- 对端 ResendRequest：application 原序号重发，设置 `43=Y`、新 52、原 52 写入 122；admin/缺失区间合并成 GapFill。每次 replay/GapFill 都先以独立 transmission 原子持久化，socket flush 后再标记 Written，不推进 `next_out`。
 - 空闲：无出站一个 HeartBtInt 发 Heartbeat；无入站两个 HeartBtInt 发 TestRequest；到期先发 Logout 再 Blocked。
 - 对端 TestRequest：入站 commit 后回相同 112 的 Heartbeat。
 - 断线：`fixd` 清空会话槽，按配置指数退避重连；redb 恢复 next_in/next_out。Agent status 仍返回 `disconnected`。
@@ -119,7 +119,7 @@ fixd validate --profile venue.toml
 }
 ```
 
-IPC 是 `u32 big-endian payload_length || UTF-8 JSON`，单 frame 上限 256 KiB。完整 Schema 是 `schemas/control-request.schema.json`。
+IPC 是 `u32 big-endian payload_length || UTF-8 JSON`，单 frame 上限 256 KiB。daemon 最多保留 64 个并发 client，每个 frame 的读写期限为 5 秒。完整 Schema 是 `schemas/control-request.schema.json`。
 
 命令：`session_status`、`session_logout`、`new_order_single`、`cancel_order`、`replace_order`。价格/数量必须是正十进制字符串；daemon 注入 8/9/10/11/34/35/49/52/56/60 等受管 tag。
 
@@ -159,13 +159,13 @@ IPC 是 `u32 big-endian payload_length || UTF-8 JSON`，单 frame 上限 256 KiB
 
 ## 存储、审计与交易安全
 
-- redb 表：meta、commands、outbound、inbound、events、audit。
+- redb 表：meta、commands、outbound、transmissions、inbound、events、audit。
 - write transaction 使用 `Durability::Immediate`；sequence 和对应 record 同事务更新。
 - audit record 为 `HMAC-SHA256(previous_hash || canonical_event_json)`；每次 open 从 1 到 `next_audit-1` 重算，缺口、错误 key 或内容变化均拒绝启动。
-- Logon 553/554/925 和字典 sensitive tag 的 journal 值为 `<redacted>`。
-- policy：symbol allowlist、最大 quantity、最大 notional、market-order gate、每秒消息滑动窗口；幂等重试不重复消耗窗口。
+- 所有自定义 Logon 字段、553/554/925 和字典 sensitive tag 的 journal 值为 `<redacted>`；入站敏感 tag 在 commit 前拒绝。
+- policy：symbol allowlist、最大 quantity、最大 notional、每秒消息滑动窗口；持久幂等查询、限流和 submit 在控制面 single-flight 区间内执行。市场单在具备受限参考价格前始终拒绝。
 - dry-run 完成 schema/策略/字段映射但不访问 socket；certification 才可发；live 在 config 和 request 两层拒绝。
-- 本地 IPC 不是 live 身份认证。Windows named pipe 默认拒绝远程 client；Unix socket 拒绝覆盖非 socket 路径并设置 0600。
+- 本地 IPC 不是 live 身份认证。Windows named pipe 显式拒绝远程 client；Unix socket 拒绝覆盖非 socket 路径并设置 0600。
 
 ## Workspace
 
@@ -207,6 +207,6 @@ workspace 使用 Rust 2024、MSRV 1.97、resolver 3 和 committed `Cargo.lock`�
 
 ## 已验证与未验证
 
-已在 Windows MSVC / Rust 1.97.1 执行 workspace `fmt`、`check --all-targets`、测试、真实 named pipe、真实进程 CLI E2E 和 10,000 例 fuzz；最终提交前再次执行全套命令。
+已在 Windows MSVC / Rust 1.97.1 执行 workspace `fmt`、`check --all-targets`、自动测试、真实 named pipe 和 10,000 例 fuzz；本次开发另人工执行过真实 `fix-mock` + `fixd` + `fixctl` 进程级 smoke。仓库当前没有自动 child-process E2E。
 
 未验证：Linux/macOS、真实 venue、TLS、live、HA、断电和大规模性能。任何这些内容都不得从当前测试结果推断为可用。

@@ -44,7 +44,7 @@ async fn logon_credentials_are_sent_but_redacted_from_the_replay_journal() {
         wire: Arc::clone(&captured),
     });
     let (client, mut server) = duplex(8192);
-    let mut dictionary = CompiledDictionary::new("FIX.4.4").with_message(MessageDefinition {
+    let dictionary = CompiledDictionary::new("FIX.4.4").with_message(MessageDefinition {
         name: "Logon".to_owned(),
         msg_type: "A".to_owned(),
         members: vec![
@@ -54,11 +54,10 @@ async fn logon_credentials_are_sent_but_redacted_from_the_replay_journal() {
             MemberDefinition::field(52, true),
             MemberDefinition::field(98, true),
             MemberDefinition::field(108, true),
-            MemberDefinition::field(553, true),
-            MemberDefinition::field(554, true),
+            MemberDefinition::field(9001, true),
+            MemberDefinition::field(9002, true),
         ],
     });
-    dictionary.sensitive_tags.extend([553, 554]);
     let _session = spawn_initiator_with_dictionary_and_logon_fields(
         client,
         SessionConfig {
@@ -70,8 +69,8 @@ async fn logon_credentials_are_sent_but_redacted_from_the_replay_journal() {
         },
         Arc::new(dictionary),
         vec![
-            Field::new(553, Bytes::from_static(b"test-user")),
-            Field::new(554, Bytes::from_static(b"test-password")),
+            Field::new(9001, Bytes::from_static(b"test-user")),
+            Field::new(9002, Bytes::from_static(b"test-password")),
         ],
         store,
         Arc::new(StaticTimeSource::new("20260726-15:00:00.000")),
@@ -91,10 +90,10 @@ async fn logon_credentials_are_sent_but_redacted_from_the_replay_journal() {
         .expect("captured journal");
     let journal = parse_frame(&journal, &ParseDictionary::new()).expect("parse journaled Logon");
 
-    assert_eq!(sent.values(553).next(), Some(b"test-user".as_slice()));
-    assert_eq!(sent.values(554).next(), Some(b"test-password".as_slice()));
-    assert_eq!(journal.values(553).next(), Some(b"<redacted>".as_slice()));
-    assert_eq!(journal.values(554).next(), Some(b"<redacted>".as_slice()));
+    assert_eq!(sent.values(9001).next(), Some(b"test-user".as_slice()));
+    assert_eq!(sent.values(9002).next(), Some(b"test-password".as_slice()));
+    assert_eq!(journal.values(9001).next(), Some(b"<redacted>".as_slice()));
+    assert_eq!(journal.values(9002).next(), Some(b"<redacted>".as_slice()));
     assert!(
         !journal
             .fields

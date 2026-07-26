@@ -8,10 +8,10 @@
 
 - TagValue frame/codec：SOH、BodyLength、CheckSum、DATA/Length、半包/粘包、重复 tag、严格 Repeating Group。
 - SessionActor：Logon、Logout、Heartbeat、TestRequest、ResendRequest、GapFill SequenceReset、Reject 记录、序号持久化、回放、PossDup 原文校验、超时 Logout、指数退避重连。
-- redb 原子 journal：序号、出入站原文、命令幂等、事件和 HMAC-SHA256 审计链；恢复时验证审计链。
+- redb 原子 journal：序号、出入站原文、resend transmission、命令幂等、事件和 HMAC-SHA256 审计链；恢复时验证审计链。
 - Agent 控制面：带版本的 JSON Schema、u32 大端长度帧、本机 Windows named pipe / Unix socket、确定性 ClOrdID、策略校验、限流、dry-run / certification / live guard。
 - 外部字典：纯 Rust Orchestra XML 编译器，解析 DATA `lengthId`、component、group、nested group 和敏感标签。
-- 测试工具：TCP mock acceptor、属性测试、纯 Rust bounded mutational fuzz、存储/断线故障注入、进程级 CLI 端到端测试。
+- 测试工具：TCP mock acceptor、属性测试、纯 Rust bounded mutational fuzz、存储/断线/回放故障注入、自动 Agent-to-mock 端到端测试；另有人工作过进程级 CLI smoke test。
 
 ## 快速开始
 
@@ -19,6 +19,16 @@
 
 ```powershell
 cargo build --workspace
+
+New-Item -ItemType Directory -Force secrets | Out-Null
+$auditKeyPath = Join-Path $PWD "secrets/audit.key"
+if (-not (Test-Path -LiteralPath $auditKeyPath)) {
+  $auditKey = New-Object byte[] 32
+  $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  $rng.GetBytes($auditKey)
+  [System.IO.File]::WriteAllBytes($auditKeyPath, $auditKey)
+  $rng.Dispose()
+}
 
 cargo run -p fixdictc -- `
   --input examples/certification/fix44-mock-orchestra.xml `
@@ -93,7 +103,7 @@ cargo run -p fixd -- schema --output schemas/control-request.schema.json
 logon_fields_file = "../../secrets/logon-fields.json"
 ```
 
-Tag 553/554/925 以及字典标记的敏感字段会在 redb replay journal 中替换为 `<redacted>`；真实值只写向 socket。示例文件不能用于真实环境。当前 MVP 尚未实现进程内 secret zeroization 或 OS key vault。
+所有 `logon_fields_file` 自定义字段、Tag 553/554/925 以及字典标记的敏感字段都会在 redb replay journal 中替换为 `<redacted>`；真实值只写向 socket。含敏感 tag 的入站消息会在持久化前 fail-closed。审计 key 必须是未跟踪的至少 32 字节随机文件，配置会拒绝 `.example`。已有数据库对应的 key 不得被覆盖或随意轮换，否则审计链会拒绝启动。当前 MVP 尚未实现进程内 secret zeroization 或 OS key vault。
 
 ## 验证
 
@@ -115,5 +125,6 @@ cargo run -p fix-fuzz -- --seed 4354685564936845355 --cases 10000 --max-input-by
 
 - `runtime_mode = "live"` 和所有 `execution_mode = "live"` 请求当前均被拒绝。
 - `plaintext_cert` 只允许认证/本地 mock 环境，不是生产传输。
+- 市场单当前始终拒绝；在实现受限参考价格/名义金额策略前，`allow_market_orders = true` 会使配置校验失败。
 - rustls 的默认 AWS-LC provider和 ring 都会引入 native 源码；实验性的纯 Rust RustCrypto provider尚未达到本项目生产 gate，因此本版本没有悄悄降级到 OpenSSL 或 native TLS。
 - 每个 profile 必须使用独立数据库、字典哈希、审计 key、CompID 和本地 IPC endpoint。

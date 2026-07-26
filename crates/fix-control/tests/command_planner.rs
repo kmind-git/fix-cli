@@ -106,3 +106,62 @@ fn live_runtime_still_rejects_unimplemented_capability_proofs() {
 
     assert_eq!(error.code(), "LIVE_GUARD_NOT_ARMED");
 }
+
+#[test]
+fn market_orders_fail_closed_even_if_a_legacy_policy_flag_is_true() {
+    let planner = CommandPlanner::new(
+        "broker-a-uat",
+        RuntimeMode::Certification,
+        Policy {
+            allowed_symbols: BTreeSet::from(["IBM".to_owned()]),
+            max_quantity: Decimal::from(1_000),
+            max_notional: Decimal::from(1_000_000),
+            allow_market_orders: true,
+            max_messages_per_second: 10,
+        },
+    );
+    let request = ControlRequest {
+        version: 1,
+        request_id: "market-1".to_owned(),
+        profile: "broker-a-uat".to_owned(),
+        execution_mode: ExecutionMode::Certification,
+        command: Command::NewOrderSingle(NewOrderSingle {
+            symbol: "IBM".to_owned(),
+            side: Side::Buy,
+            quantity: "10".to_owned(),
+            order_type: OrderType::Market,
+            price: None,
+            time_in_force: TimeInForce::Day,
+        }),
+        auth: None,
+    };
+
+    let error = planner
+        .plan(&request)
+        .expect_err("market order lacks bounded notional");
+
+    assert_eq!(error.code(), "POLICY_DENIED");
+}
+
+#[test]
+fn dry_run_logout_cannot_mutate_the_session() {
+    let planner = CommandPlanner::new(
+        "broker-a-uat",
+        RuntimeMode::Certification,
+        Policy::deny_all(),
+    );
+    let request = ControlRequest {
+        version: 1,
+        request_id: "logout-dry-run".to_owned(),
+        profile: "broker-a-uat".to_owned(),
+        execution_mode: ExecutionMode::DryRun,
+        command: Command::SessionLogout,
+        auth: None,
+    };
+
+    let error = planner
+        .plan(&request)
+        .expect_err("dry-run must never send Logout");
+
+    assert_eq!(error.code(), "INVALID_REQUEST");
+}

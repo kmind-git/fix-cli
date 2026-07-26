@@ -167,6 +167,12 @@ impl DaemonConfig {
                 "max_messages_per_second must be positive",
             ));
         }
+        if self.policy.allow_market_orders {
+            return Err(ConfigError::message(
+                "INVALID_CONFIG",
+                "allow_market_orders cannot be enabled until a bounded reference-price policy is implemented",
+            ));
+        }
         for (name, value) in [
             ("max_quantity", self.policy.max_quantity.as_str()),
             ("max_notional", self.policy.max_notional.as_str()),
@@ -190,6 +196,16 @@ impl DaemonConfig {
             return Err(ConfigError::message(
                 "INVALID_CONFIG",
                 "dictionary_sha256 must contain 64 hexadecimal characters",
+            ));
+        }
+        if self
+            .audit_key_file
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("example"))
+        {
+            return Err(ConfigError::message(
+                "INVALID_CONFIG",
+                "audit_key_file must not point at a tracked example file",
             ));
         }
         Ok(())
@@ -223,36 +239,8 @@ pub async fn run_daemon(config_path: PathBuf) -> Result<(), DaemonError> {
     let base = config_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
-    let dictionary_path = resolve(base, &config.dictionary);
-    let dictionary_bytes =
-        std::fs::read(&dictionary_path).map_err(|error| DaemonError::Io(error.to_string()))?;
-    let actual_dictionary_hash = hex(&Sha256::digest(&dictionary_bytes));
-    if !actual_dictionary_hash.eq_ignore_ascii_case(&config.dictionary_sha256) {
-        return Err(DaemonError::Dictionary(format!(
-            "dictionary SHA-256 mismatch: expected {}, got {actual_dictionary_hash}",
-            config.dictionary_sha256
-        )));
-    }
-    let dictionary: fix_protocol::CompiledDictionary = serde_json::from_slice(&dictionary_bytes)
-        .map_err(|error| DaemonError::Dictionary(error.to_string()))?;
-    if !dictionary
-        .begin_strings
-        .iter()
-        .any(|value| value == &config.session.begin_string)
-    {
-        return Err(DaemonError::Dictionary(
-            "dictionary does not allow the configured BeginString".to_owned(),
-        ));
-    }
-
-    let audit_key = std::fs::read(resolve(base, &config.audit_key_file))
-        .map_err(|error| DaemonError::Io(error.to_string()))?;
-    if audit_key.len() < 32 {
-        return Err(DaemonError::Config(ConfigError::message(
-            "INVALID_CONFIG",
-            "audit key must contain at least 32 bytes",
-        )));
-    }
+    let dictionary = load_dictionary(base, &config)?;
+    let audit_key = load_audit_key(base, &config)?;
     let database_path = resolve(base, &config.database);
     if let Some(parent) = database_path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| DaemonError::Io(error.to_string()))?;
@@ -278,6 +266,7 @@ pub async fn run_daemon(config_path: PathBuf) -> Result<(), DaemonError> {
     };
     let planner = CommandPlanner::new(&config.profile, RuntimeMode::Certification, policy);
     let sessions = SessionSlot::new();
+    let control_store = store.clone();
     tokio::spawn(run_connection_manager(
         config.transport.clone(),
         config.session.clone(),
@@ -286,33 +275,52 @@ pub async fn run_daemon(config_path: PathBuf) -> Result<(), DaemonError> {
         store,
         sessions.clone(),
     ));
-    let service = Arc::new(ControlService::new_dynamic(planner, sessions));
+    let service = Arc::new(ControlService::new_dynamic_with_store(
+        planner,
+        sessions,
+        control_store,
+    ));
     let endpoint = config
         .ipc_endpoint
         .clone()
         .unwrap_or_else(|| endpoint_for_profile(&config.profile));
     let mut listener =
         LocalListener::bind(endpoint).map_err(|error| DaemonError::Ipc(error.to_string()))?;
+    let client_slots = Arc::new(tokio::sync::Semaphore::new(64));
+    let frame_timeout = tokio::time::Duration::from_secs(5);
 
     loop {
         let mut client = listener
             .accept()
             .await
             .map_err(|error| DaemonError::Ipc(error.to_string()))?;
+        let Ok(client_slot) = Arc::clone(&client_slots).try_acquire_owned() else {
+            drop(client);
+            continue;
+        };
         let service = Arc::clone(&service);
         tokio::spawn(async move {
+            let _client_slot = client_slot;
             loop {
-                let request: ControlRequest = match read_json_frame(&mut client, 256 * 1024).await {
-                    Ok(request) => request,
-                    Err(_) => return,
+                let request: ControlRequest = match tokio::time::timeout(
+                    frame_timeout,
+                    read_json_frame(&mut client, 256 * 1024),
+                )
+                .await
+                {
+                    Ok(Ok(request)) => request,
+                    Ok(Err(_)) | Err(_) => return,
                 };
                 let response = service.execute(request).await;
-                if write_json_frame(&mut client, &response, 256 * 1024)
-                    .await
-                    .is_err()
+                match tokio::time::timeout(
+                    frame_timeout,
+                    write_json_frame(&mut client, &response, 256 * 1024),
+                )
+                .await
                 {
-                    return;
-                }
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) | Err(_) => return,
+                };
             }
         });
     }
@@ -410,17 +418,46 @@ pub fn validate_daemon_files(config_path: &std::path::Path) -> Result<(), Daemon
     let base = config_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
+    load_dictionary(base, &config)?;
+    load_logon_fields(base, config.session.logon_fields_file.as_deref())?;
+    load_audit_key(base, &config)?;
+    Ok(())
+}
+
+fn load_dictionary(
+    base: &std::path::Path,
+    config: &DaemonConfig,
+) -> Result<fix_protocol::CompiledDictionary, DaemonError> {
     let dictionary_bytes = std::fs::read(resolve(base, &config.dictionary))
         .map_err(|error| DaemonError::Io(error.to_string()))?;
     let actual_dictionary_hash = hex(&Sha256::digest(&dictionary_bytes));
     if !actual_dictionary_hash.eq_ignore_ascii_case(&config.dictionary_sha256) {
+        return Err(DaemonError::Dictionary(format!(
+            "dictionary SHA-256 mismatch: expected {}, got {actual_dictionary_hash}",
+            config.dictionary_sha256
+        )));
+    }
+    let dictionary: fix_protocol::CompiledDictionary = serde_json::from_slice(&dictionary_bytes)
+        .map_err(|error| DaemonError::Dictionary(error.to_string()))?;
+    if dictionary.artifact_version != 1 {
+        return Err(DaemonError::Dictionary(format!(
+            "unsupported dictionary artifact_version {}; expected 1",
+            dictionary.artifact_version
+        )));
+    }
+    if !dictionary
+        .begin_strings
+        .iter()
+        .any(|value| value == &config.session.begin_string)
+    {
         return Err(DaemonError::Dictionary(
-            "dictionary SHA-256 mismatch".to_owned(),
+            "dictionary does not allow the configured BeginString".to_owned(),
         ));
     }
-    serde_json::from_slice::<fix_protocol::CompiledDictionary>(&dictionary_bytes)
-        .map_err(|error| DaemonError::Dictionary(error.to_string()))?;
-    load_logon_fields(base, config.session.logon_fields_file.as_deref())?;
+    Ok(dictionary)
+}
+
+fn load_audit_key(base: &std::path::Path, config: &DaemonConfig) -> Result<Vec<u8>, DaemonError> {
     let audit_key = std::fs::read(resolve(base, &config.audit_key_file))
         .map_err(|error| DaemonError::Io(error.to_string()))?;
     if audit_key.len() < 32 {
@@ -429,7 +466,7 @@ pub fn validate_daemon_files(config_path: &std::path::Path) -> Result<(), Daemon
             "audit key must contain at least 32 bytes",
         )));
     }
-    Ok(())
+    Ok(audit_key)
 }
 
 #[derive(Debug, Deserialize)]
@@ -466,7 +503,7 @@ fn load_logon_fields(
         )));
     }
     let mut tags = BTreeSet::new();
-    document
+    let fields = document
         .fields
         .into_iter()
         .map(|field| {
@@ -485,7 +522,11 @@ fn load_logon_fields(
                 Bytes::from(field.value),
             ))
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    fix_session::validate_custom_logon_fields(&fields).map_err(|error| {
+        DaemonError::Config(ConfigError::message("INVALID_CONFIG", error.to_string()))
+    })?;
+    Ok(fields)
 }
 
 fn resolve(base: &std::path::Path, path: &std::path::Path) -> PathBuf {

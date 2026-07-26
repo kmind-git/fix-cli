@@ -1,6 +1,7 @@
 use fix_store::{
-    AuditEvent, CommandPhase, EventRecord, InboundCommit, MarkOutboundWritten, MemoryStore,
-    OutboundCommit, RedbStore, StoreOp, StorePort, StoreReply, StoreWorker,
+    AuditEvent, CommandPhase, EventRecord, InboundCommit, MarkOutboundWritten,
+    MarkTransmissionWritten, MemoryStore, OutboundCommit, RedbStore, StoreOp, StorePort,
+    StoreReply, StoreWorker, TransmissionCommit, TransmissionPhase,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -77,6 +78,44 @@ fn outbound_commit_atomically_advances_sequence_and_is_idempotent() {
     assert_eq!(first_command, retry_command);
     assert_eq!(first_command.phase, CommandPhase::Journaled);
     assert_eq!(store.audit_records().len(), 1);
+
+    let lookup = store
+        .apply(StoreOp::LoadCommand("agent-1".to_owned()))
+        .expect("lookup command");
+    assert!(matches!(
+        lookup,
+        StoreReply::StoredCommand(Some(ref command)) if command == &first_command
+    ));
+}
+
+#[test]
+fn resend_transmission_is_durably_journaled_before_it_is_marked_written() {
+    let mut store = MemoryStore::new(b"audit-test-key");
+    let journaled = store
+        .apply(StoreOp::CommitTransmission(TransmissionCommit {
+            msg_seq_num: 7,
+            kind: "application_replay".to_owned(),
+            wire: b"replay-wire".to_vec(),
+            audit: audit("replay_journaled"),
+        }))
+        .expect("journal transmission");
+    let StoreReply::Transmission(journaled) = journaled else {
+        panic!("transmission commit must return its record");
+    };
+    assert_eq!(journaled.phase, TransmissionPhase::Journaled);
+    assert_eq!(journaled.wire, b"replay-wire");
+
+    let written = store
+        .apply(StoreOp::MarkTransmissionWritten(MarkTransmissionWritten {
+            id: journaled.id,
+            audit: audit("replay_written"),
+        }))
+        .expect("mark transmission written");
+    let StoreReply::Transmission(written) = written else {
+        panic!("mark transmission must return its record");
+    };
+    assert_eq!(written.phase, TransmissionPhase::Written);
+    assert_eq!(store.audit_records().len(), 2);
 }
 
 #[test]
@@ -132,6 +171,44 @@ fn redb_store_rejects_an_audit_chain_opened_with_the_wrong_key() {
         error,
         fix_store::StoreError::AuditChainInvalid { .. }
     ));
+    std::fs::remove_file(path).expect("remove test database");
+}
+
+#[test]
+fn redb_reopens_a_journaled_resend_transmission() {
+    let path = test_database_path("transmission-recovery");
+    std::fs::create_dir_all(path.parent().expect("test database parent"))
+        .expect("create test database parent");
+    let _ = std::fs::remove_file(&path);
+    let transmission_id = {
+        let mut store = RedbStore::open(&path, b"audit-test-key").expect("create redb store");
+        let reply = store
+            .apply(StoreOp::CommitTransmission(TransmissionCommit {
+                msg_seq_num: 4,
+                kind: "gap_fill".to_owned(),
+                wire: b"gap-fill-wire".to_vec(),
+                audit: audit("gap_fill_journaled"),
+            }))
+            .expect("persist transmission");
+        let StoreReply::Transmission(record) = reply else {
+            panic!("expected transmission record");
+        };
+        record.id
+    };
+
+    {
+        let mut store = RedbStore::open(&path, b"audit-test-key").expect("reopen redb store");
+        let reply = store
+            .apply(StoreOp::LoadTransmission(transmission_id))
+            .expect("load transmission");
+        let StoreReply::StoredTransmission(Some(record)) = reply else {
+            panic!("reopened transmission must exist");
+        };
+        assert_eq!(record.kind, "gap_fill");
+        assert_eq!(record.phase, TransmissionPhase::Journaled);
+        assert_eq!(record.wire, b"gap-fill-wire");
+    }
+
     std::fs::remove_file(path).expect("remove test database");
 }
 

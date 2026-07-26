@@ -114,6 +114,7 @@ impl LocalListener {
 
         let mut options = ServerOptions::new();
         options.first_pipe_instance(self.first_instance);
+        options.reject_remote_clients(true);
         let server = options
             .create(&self.pipe_name)
             .map_err(|error| IpcError::Io(error.to_string()))?;

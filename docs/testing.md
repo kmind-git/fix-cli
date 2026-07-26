@@ -7,9 +7,9 @@
 | 单元 | BodyLength/CheckSum、DATA、group、Orchestra 编译、策略映射、错误码、redb 事务 |
 | 确定性属性 | 2,000 个 codec round-trip + 任意 fragmentation；10,000 个 bounded random input 抗崩溃 |
 | 集成 | SessionActor Logon/Logout/heartbeat/TestRequest/resend/gapfill/replay/PossDup；Windows named pipe；TCP reconnect |
-| 故障注入 | journal 失败不得写 socket；传输断开重连并恢复序号；错误审计 key 拒绝恢复 |
+| 故障注入 | application/replay journal 失败不得写 socket；传输断开重连并恢复序号；错误审计 key 拒绝恢复 |
 | 端到端 | Agent `ControlRequest` → ControlService → SessionActor → mock venue → ExecutionReport |
-| 进程级 | `fix-mock` + `fixd` + `fixctl` 实际进程，验证 status 与 certification NewOrderSingle |
+| 进程级 smoke | 本次开发中人工运行 `fix-mock` + `fixd` + `fixctl`，验证 status 与 certification NewOrderSingle；尚未提交自动 child-process 测试 |
 | 纯 Rust fuzz | `fix-fuzz` 固定 seed bounded mutator，不依赖 libFuzzer/C++ |
 
 ## 常规命令

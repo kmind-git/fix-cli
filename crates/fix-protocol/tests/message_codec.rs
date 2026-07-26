@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use fix_protocol::{
     CompiledDictionary, Field, Item, MemberDefinition, MessageDefinition, ParseDictionary,
-    encode_message, parse_frame,
+    ValidationError, encode_message, parse_frame,
 };
 
 #[test]
@@ -70,4 +70,34 @@ fn dictionary_materializes_repeating_group_entries_without_losing_duplicate_tags
     assert_eq!(group.entries.len(), 2);
     assert_eq!(group.entries[0].fields()[0].value, b"PARTY-1"[..]);
     assert_eq!(group.entries[1].fields()[0].value, b"PARTY-2"[..]);
+}
+
+#[test]
+fn dictionary_rejects_a_group_count_larger_than_the_remaining_message() {
+    let dictionary = CompiledDictionary::new("FIX.4.4").with_message(MessageDefinition {
+        name: "PartyList".to_owned(),
+        msg_type: "Z".to_owned(),
+        members: vec![MemberDefinition::group(
+            453,
+            448,
+            true,
+            vec![MemberDefinition::field(448, true)],
+        )],
+    });
+    let fields = vec![
+        Field::new(35, Bytes::from_static(b"Z")),
+        Field::new(453, Bytes::from_static(b"18446744073709551615")),
+    ];
+    let frame = encode_message(b"FIX.4.4", &fields).expect("encodable malicious count");
+    let parsed = parse_frame(&frame, &dictionary.parse_dictionary()).expect("valid FIX frame");
+
+    let error = dictionary
+        .validate(parsed)
+        .expect_err("untrusted count must not allocate");
+
+    assert!(matches!(
+        error,
+        ValidationError::GroupCountLimitExceeded { tag: 453, .. }
+            | ValidationError::InvalidGroupCount { tag: 453 }
+    ));
 }

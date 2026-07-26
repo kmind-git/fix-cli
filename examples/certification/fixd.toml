@@ -1,7 +1,7 @@
 profile = "broker-a-uat"
 runtime_mode = "certification"
 database = "../../data/broker-a-uat.redb"
-audit_key_file = "../../secrets/audit.key.example"
+audit_key_file = "../../secrets/audit.key"
 dictionary = "./dictionary/fix44-mock.json"
 dictionary_sha256 = "64aecf84358d5fd60c142724c3ff4dc3cf5920ea2c67b34fa170abe004214e60"
 

@@ -3,6 +3,7 @@
 use bytes::Bytes;
 use fix_protocol::Field;
 use fix_session::{ApplicationRequest, SessionError, SessionHandle, SessionPhase, SessionStatus};
+use fix_store::{CommandRecord, StoreHandle, StoreOp, StoreReply};
 use rust_decimal::Decimal;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -167,7 +168,14 @@ impl CommandPlanner {
 
         match &request.command {
             Command::SessionStatus => Ok(PlannedCommand::SessionStatus),
-            Command::SessionLogout => Ok(PlannedCommand::SessionLogout),
+            Command::SessionLogout => {
+                if request.execution_mode != ExecutionMode::Certification {
+                    return Err(ControlError::invalid(
+                        "session logout requires certification execution_mode",
+                    ));
+                }
+                Ok(PlannedCommand::SessionLogout)
+            }
             Command::NewOrderSingle(order) => {
                 let normalized = self.validate_order(
                     &order.symbol,
@@ -308,10 +316,11 @@ impl CommandPlanner {
             (OrderType::Market, Some(_)) => {
                 return Err(ControlError::invalid("market order must not include price"));
             }
-            (OrderType::Market, None) if !self.policy.allow_market_orders => {
-                return Err(ControlError::policy("market orders are disabled"));
+            (OrderType::Market, None) => {
+                return Err(ControlError::policy(
+                    "market orders are unsupported until a bounded reference-price policy is implemented",
+                ));
             }
-            (OrderType::Market, None) => None,
         };
 
         if let Some(price) = price {
@@ -518,6 +527,8 @@ impl ControlResponse {
 pub struct ControlService {
     planner: CommandPlanner,
     sessions: SessionSlot,
+    store: Option<StoreHandle>,
+    application_gate: tokio::sync::Mutex<()>,
     rate_limiter: SlidingWindowRateLimiter,
 }
 
@@ -569,10 +580,25 @@ impl ControlService {
 
     #[must_use]
     pub fn new_dynamic(planner: CommandPlanner, sessions: SessionSlot) -> Self {
+        Self::build(planner, sessions, None)
+    }
+
+    #[must_use]
+    pub fn new_dynamic_with_store(
+        planner: CommandPlanner,
+        sessions: SessionSlot,
+        store: StoreHandle,
+    ) -> Self {
+        Self::build(planner, sessions, Some(store))
+    }
+
+    fn build(planner: CommandPlanner, sessions: SessionSlot, store: Option<StoreHandle>) -> Self {
         let max_messages_per_second = planner.max_messages_per_second();
         Self {
             planner,
             sessions,
+            store,
+            application_gate: tokio::sync::Mutex::new(()),
             rate_limiter: SlidingWindowRateLimiter::new(max_messages_per_second),
         }
     }
@@ -619,32 +645,55 @@ impl ControlService {
                     }).collect::<Vec<_>>(),
                 })),
                 ExecutionMode::Certification | ExecutionMode::Live => {
-                    if !self.rate_limiter.try_acquire(&request.request_id) {
-                        return ControlResponse {
-                            version: 1,
-                            request_id,
-                            ok: false,
-                            result: None,
-                            error: Some(ControlErrorBody {
-                                code: "RATE_LIMITED".to_owned(),
-                                retryable: true,
-                                message: "outbound message rate limit exceeded".to_owned(),
-                            }),
-                        };
-                    }
-                    match self.sessions.current() {
-                        Some(session) => session.submit(application).await.map(|command| {
-                            serde_json::json!({
-                                "phase": match command.phase {
-                                    fix_store::CommandPhase::Journaled => "journaled",
-                                    fix_store::CommandPhase::Written => "written_to_socket",
-                                },
-                                "cl_ord_id": command.cl_ord_id,
-                                "msg_seq_num": command.msg_seq_num,
-                                "venue_status": "pending",
-                            })
-                        }),
-                        None => Err(SessionError::ActorStopped),
+                    // SessionActor is a single writer. Keep idempotency lookup, rate admission,
+                    // and submit in the same control-plane single-flight section so a failed
+                    // duplicate can never release another caller's successful reservation.
+                    let _application_admission = self.application_gate.lock().await;
+                    let session = self.sessions.current();
+                    let existing = match self
+                        .lookup_persisted_command(session.as_ref(), application.request_id.clone())
+                        .await
+                    {
+                        Ok(existing) => existing,
+                        Err(error) => return session_error_response(request_id, &error),
+                    };
+                    if let Some(existing) = existing {
+                        if existing.fingerprint != application.fingerprint {
+                            Err(SessionError::Store(format!(
+                                "request ID {} was reused with a different fingerprint",
+                                application.request_id
+                            )))
+                        } else {
+                            Ok(command_result(existing))
+                        }
+                    } else {
+                        match session {
+                            Some(session) => {
+                                if !self.rate_limiter.try_acquire(&request.request_id) {
+                                    return ControlResponse {
+                                        version: 1,
+                                        request_id,
+                                        ok: false,
+                                        result: None,
+                                        error: Some(ControlErrorBody {
+                                            code: "RATE_LIMITED".to_owned(),
+                                            retryable: true,
+                                            message: "outbound message rate limit exceeded"
+                                                .to_owned(),
+                                        }),
+                                    };
+                                }
+                                let submission = session.submit(application).await;
+                                if matches!(
+                                    submission,
+                                    Err(SessionError::ActorStopped | SessionError::NotEstablished)
+                                ) {
+                                    self.rate_limiter.release(&request.request_id);
+                                }
+                                submission.map(command_result)
+                            }
+                            None => Err(SessionError::ActorStopped),
+                        }
                     }
                 }
                 ExecutionMode::Inspect => Err(SessionError::InvalidApplication(
@@ -664,6 +713,41 @@ impl ControlService {
             Err(error) => session_error_response(request_id, &error),
         }
     }
+
+    async fn lookup_persisted_command(
+        &self,
+        session: Option<&SessionHandle>,
+        request_id: String,
+    ) -> Result<Option<CommandRecord>, SessionError> {
+        if let Some(store) = &self.store {
+            let reply = store
+                .apply(StoreOp::LoadCommand(request_id))
+                .await
+                .map_err(|error| SessionError::Store(error.to_string()))?;
+            let StoreReply::StoredCommand(command) = reply else {
+                return Err(SessionError::Store(
+                    "command lookup returned the wrong record type".to_owned(),
+                ));
+            };
+            return Ok(command);
+        }
+        match session {
+            Some(session) => session.lookup_command(request_id).await,
+            None => Ok(None),
+        }
+    }
+}
+
+fn command_result(command: CommandRecord) -> serde_json::Value {
+    serde_json::json!({
+        "phase": match command.phase {
+            fix_store::CommandPhase::Journaled => "journaled",
+            fix_store::CommandPhase::Written => "written_to_socket",
+        },
+        "cl_ord_id": command.cl_ord_id,
+        "msg_seq_num": command.msg_seq_num,
+        "venue_status": "pending",
+    })
 }
 
 struct SlidingWindowRateLimiter {
@@ -707,6 +791,17 @@ impl SlidingWindowRateLimiter {
         state.accepted.push_back((now, request_id.to_owned()));
         state.request_ids.insert(request_id.to_owned());
         true
+    }
+
+    fn release(&self, request_id: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .accepted
+            .retain(|(_, accepted_request_id)| accepted_request_id != request_id);
+        state.request_ids.remove(request_id);
     }
 }
 

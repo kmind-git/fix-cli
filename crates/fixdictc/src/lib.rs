@@ -158,7 +158,14 @@ pub fn compile_orchestra(
         dictionary = dictionary.with_data_pair(length_tag, data_tag);
     }
 
+    let mut message_types = BTreeSet::new();
     for message in messages {
+        if !message_types.insert(message.msg_type.clone()) {
+            return Err(CompileError::DuplicateDefinition(format!(
+                "message MsgType {}",
+                message.msg_type
+            )));
+        }
         let members = resolve_references(
             &message.members,
             &known_fields,
