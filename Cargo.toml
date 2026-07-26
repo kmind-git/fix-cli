@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/fix-protocol",
+    "crates/fix-control",
+    "crates/fix-fuzz",
+    "crates/fix-ipc",
+    "crates/fix-mock",
+    "crates/fix-session",
+    "crates/fix-store",
+    "crates/fixd",
+    "crates/fixctl",
+    "crates/fixdictc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0 OR MIT"
+
+[workspace.dependencies]
+bytes = "1.10"
+clap = { version = "4.5", default-features = false, features = [
+    "derive",
+    "std",
+    "help",
+    "usage",
+    "error-context",
+] }
+quick-xml = { version = "0.38", default-features = false }
+redb = { version = "4.1", default-features = false }
+rust_decimal = { version = "1.40", default-features = false, features = ["serde"] }
+schemars = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+thiserror = "2.0"
+time = { version = "0.3", default-features = false, features = ["std"] }
+toml = "0.9"
+tokio = { version = "1.53", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "signal",
+] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

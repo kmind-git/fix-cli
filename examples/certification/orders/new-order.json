@@ -1,0 +1,8 @@
+{
+  "symbol": "IBM",
+  "side": "buy",
+  "quantity": "100",
+  "ord_type": "limit",
+  "price": "187.25",
+  "time_in_force": "day"
+}

@@ -1,0 +1,9 @@
+{
+  "original_request_id": "agent-order-1",
+  "symbol": "IBM",
+  "side": "buy",
+  "quantity": "80",
+  "ord_type": "limit",
+  "price": "186.50",
+  "time_in_force": "day"
+}

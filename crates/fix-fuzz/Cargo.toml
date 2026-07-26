@@ -1,0 +1,12 @@
+[package]
+name = "fix-fuzz"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+fix-protocol = { path = "../fix-protocol" }
+
+[lints]
+workspace = true

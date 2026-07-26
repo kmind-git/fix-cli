@@ -1,0 +1,28 @@
+[package]
+name = "fixd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+clap.workspace = true
+fix-control = { path = "../fix-control" }
+fix-ipc = { path = "../fix-ipc" }
+fix-protocol = { path = "../fix-protocol" }
+fix-session = { path = "../fix-session" }
+fix-store = { path = "../fix-store" }
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+fix-mock = { path = "../fix-mock" }
+
+[lints]
+workspace = true

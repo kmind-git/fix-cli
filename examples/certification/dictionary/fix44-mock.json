@@ -1,0 +1,726 @@
+{
+  "artifact_version": 1,
+  "begin_strings": [
+    "FIX.4.4"
+  ],
+  "messages": {
+    "0": {
+      "name": "Heartbeat",
+      "msg_type": "0",
+      "members": [
+        {
+          "kind": "field",
+          "tag": 49,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 56,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 34,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 43,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 52,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 122,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 112,
+          "required": false
+        }
+      ]
+    },
+    "1": {
+      "name": "TestRequest",
+      "msg_type": "1",
+      "members": [
+        {
+          "kind": "field",
+          "tag": 49,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 56,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 34,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 43,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 52,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 122,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 112,
+          "required": true
+        }
+      ]
+    },
+    "2": {
+      "name": "ResendRequest",
+      "msg_type": "2",
+      "members": [
+        {
+          "kind": "field",
+          "tag": 49,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 56,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 34,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 43,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 52,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 122,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 7,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 16,
+          "required": true
+        }
+      ]
+    },
+    "3": {
+      "name": "Reject",
+      "msg_type": "3",
+      "members": [
+        {
+          "kind": "field",
+          "tag": 49,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 56,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 34,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 43,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 52,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 122,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 45,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 371,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 372,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 373,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 58,
+          "required": false
+        }
+      ]
+    },
+    "4": {
+      "name": "SequenceReset",
+      "msg_type": "4",
+      "members": [
+        {
+          "kind": "field",
+          "tag": 49,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 56,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 34,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 43,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 52,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 122,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 123,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 36,
+          "required": true
+        }
+      ]
+    },
+    "5": {
+      "name": "Logout",
+      "msg_type": "5",
+      "members": [
+        {
+          "kind": "field",
+          "tag": 49,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 56,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 34,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 43,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 52,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 122,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 58,
+          "required": false
+        }
+      ]
+    },
+    "8": {
+      "name": "ExecutionReport",
+      "msg_type": "8",
+      "members": [
+        {
+          "kind": "field",
+          "tag": 49,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 56,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 34,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 43,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 52,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 122,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 37,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 17,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 150,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 39,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 11,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 41,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 55,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 54,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 151,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 14,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 6,
+          "required": true
+        }
+      ]
+    },
+    "A": {
+      "name": "Logon",
+      "msg_type": "A",
+      "members": [
+        {
+          "kind": "field",
+          "tag": 49,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 56,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 34,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 43,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 52,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 122,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 98,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 108,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 1137,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 553,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 554,
+          "required": false
+        }
+      ]
+    },
+    "D": {
+      "name": "NewOrderSingle",
+      "msg_type": "D",
+      "members": [
+        {
+          "kind": "field",
+          "tag": 49,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 56,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 34,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 43,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 52,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 122,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 11,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 21,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 55,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 54,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 60,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 38,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 40,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 44,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 59,
+          "required": true
+        }
+      ]
+    },
+    "F": {
+      "name": "OrderCancelRequest",
+      "msg_type": "F",
+      "members": [
+        {
+          "kind": "field",
+          "tag": 49,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 56,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 34,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 43,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 52,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 122,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 11,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 41,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 55,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 54,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 60,
+          "required": true
+        }
+      ]
+    },
+    "G": {
+      "name": "OrderCancelReplaceRequest",
+      "msg_type": "G",
+      "members": [
+        {
+          "kind": "field",
+          "tag": 49,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 56,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 34,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 43,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 52,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 122,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 11,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 41,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 55,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 54,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 60,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 38,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 40,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 44,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 59,
+          "required": true
+        }
+      ]
+    },
+    "j": {
+      "name": "BusinessMessageReject",
+      "msg_type": "j",
+      "members": [
+        {
+          "kind": "field",
+          "tag": 49,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 56,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 34,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 43,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 52,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 122,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 45,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 372,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 379,
+          "required": false
+        },
+        {
+          "kind": "field",
+          "tag": 380,
+          "required": true
+        },
+        {
+          "kind": "field",
+          "tag": 58,
+          "required": false
+        }
+      ]
+    }
+  },
+  "data_pairs": {},
+  "sensitive_tags": [
+    553,
+    554
+  ],
+  "source_sha256": "5aec9d2135a118ad8cf2d0bcbda54a67da0a3739c8f87fe3156cd1222b8dda8f"
+}

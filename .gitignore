@@ -1,5 +1,8 @@
 /target/
-Cargo.lock
+/.cargo-home/
 .env
 .env.*
 *.log
+/data/
+/secrets/*
+!/secrets/*.example
