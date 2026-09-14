@@ -1,6 +1,9 @@
 {
   "original_request_id": "agent-order-1",
   "symbol": "IBM",
+  "account": "110853",
+  "security_exchange": "XSGE",
+  "security_group": "FUT",
   "side": "buy",
   "quantity": "80",
   "ord_type": "limit",

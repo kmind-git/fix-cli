@@ -33,7 +33,6 @@ enum Command {
         #[command(subcommand)]
         command: OrderCommand,
     },
-    Schema,
 }
 
 #[derive(Debug, Subcommand)]
@@ -93,19 +92,6 @@ impl From<Mode> for ExecutionMode {
 #[tokio::main]
 async fn main() {
     let arguments = Arguments::parse();
-    if matches!(arguments.command, Command::Schema) {
-        match serde_json::to_string_pretty(&fix_control::control_request_schema()) {
-            Ok(schema) => {
-                println!("{schema}");
-                return;
-            }
-            Err(error) => {
-                eprintln!("{error}");
-                std::process::exit(70);
-            }
-        }
-    }
-
     let profile = match arguments.profile {
         Some(profile) => profile,
         None => {
@@ -229,7 +215,6 @@ fn build_request(profile: &str, command: Command) -> Result<ControlRequest, Stri
                 auth: None,
             })
         }
-        Command::Schema => Err("schema does not create a request".to_owned()),
     }
 }
 

@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use fix_protocol::{Field, FrameDecoder, ParseDictionary, encode_message, parse_frame};
+use fix_protocol::{Field, FrameDecoder, encode_message, parse_frame};
 
 struct XorShift64(u64);
 
@@ -55,7 +55,7 @@ fn property_encoded_messages_round_trip_under_arbitrary_fragmentation() {
         }
 
         assert_eq!(frames.len(), 1, "case {case}");
-        let parsed = parse_frame(&frames[0], &ParseDictionary::new())
+        let parsed = parse_frame(&frames[0])
             .unwrap_or_else(|error| panic!("case {case} parse failed: {error}"));
         assert_eq!(parsed.begin_string.as_ref(), b"FIX.4.4", "case {case}");
         assert_eq!(parsed.fields, expected, "case {case}");

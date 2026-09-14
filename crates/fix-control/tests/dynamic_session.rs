@@ -2,9 +2,8 @@ use fix_control::{
     Command, CommandPlanner, ControlRequest, ControlService, ExecutionMode, NewOrderSingle,
     OrderType, PlannedCommand, Policy, RuntimeMode, SessionSlot, Side, TimeInForce,
 };
-use fix_store::{AuditEvent, MemoryStore, OutboundCommit, StoreOp, StoreWorker};
+use fix_store::{OutboundCommit, StoreOp};
 use rust_decimal::Decimal;
-use std::collections::{BTreeMap, BTreeSet};
 
 #[tokio::test]
 async fn dynamic_control_service_reports_disconnected_while_reconnect_is_pending() {
@@ -42,7 +41,6 @@ async fn persisted_idempotency_is_available_while_the_session_slot_is_disconnect
         "reconnect-test",
         RuntimeMode::Certification,
         Policy {
-            allowed_symbols: BTreeSet::from(["IBM".to_owned()]),
             max_quantity: Decimal::from(1_000),
             max_notional: Decimal::from(1_000_000),
             allow_market_orders: false,
@@ -55,7 +53,7 @@ async fn persisted_idempotency_is_available_while_the_session_slot_is_disconnect
     else {
         panic!("expected application command");
     };
-    let store = StoreWorker::spawn(MemoryStore::new(b"control-store-audit-key"));
+    let store = test_store();
     store
         .apply(StoreOp::CommitOutbound(OutboundCommit {
             request_id: application.request_id,
@@ -63,10 +61,6 @@ async fn persisted_idempotency_is_available_while_the_session_slot_is_disconnect
             cl_ord_id: application.cl_ord_id,
             msg_seq_num: 1,
             wire: b"persisted-wire".to_vec(),
-            audit: AuditEvent {
-                kind: "application_journaled".to_owned(),
-                details: BTreeMap::new(),
-            },
         }))
         .await
         .expect("persist command");
@@ -97,12 +91,25 @@ fn order(request_id: &str, price: &str) -> ControlRequest {
         execution_mode: ExecutionMode::Certification,
         command: Command::NewOrderSingle(NewOrderSingle {
             symbol: "IBM".to_owned(),
+            account: "110853".to_owned(),
+            security_exchange: "XSGE".to_owned(),
+            security_group: "FUT".to_owned(),
             side: Side::Buy,
             quantity: "10".to_owned(),
             order_type: OrderType::Limit,
             price: Some(price.to_owned()),
             time_in_force: TimeInForce::Day,
+            maturity_month_year: None,
+            extra_tags: Vec::new(),
         }),
         auth: None,
     }
+}
+
+fn test_store() -> fix_store::StoreHandle {
+    fix_store::StoreWorker::spawn(test_redb())
+}
+
+fn test_redb() -> fix_store::RedbStore {
+    fix_store::RedbStore::open_in_memory()
 }

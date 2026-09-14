@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use fix_protocol::{FrameDecoder, ParseDictionary, parse_frame};
+use fix_protocol::{FrameDecoder, parse_frame};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FuzzConfig {
@@ -50,7 +50,7 @@ pub fn run_campaign(config: FuzzConfig) -> FuzzStats {
                 Ok(frames) => {
                     stats.framed_messages += frames.len();
                     for frame in frames {
-                        if parse_frame(&frame, &ParseDictionary::new()).is_ok() {
+                        if parse_frame(&frame).is_ok() {
                             stats.parsed_messages += 1;
                         } else {
                             rejected = true;

@@ -1,13 +1,13 @@
 #![forbid(unsafe_code)]
 
+pub mod logging;
+pub mod quickfix_cfg;
+
 use bytes::Bytes;
-use fix_protocol::{
-    CompiledDictionary, Field, FrameDecoder, ParseDictionary, ParsedMessage, encode_message,
-    parse_frame,
-};
+use fix_protocol::{Field, FrameDecoder, ParsedMessage, encode_message, parse_frame};
 use fix_store::{
-    AuditEvent, CommandRecord, EventRecord, InboundCommit, MarkOutboundWritten,
-    MarkTransmissionWritten, OutboundCommit, OutboundRange, StoreHandle, StoreOp, StoreReply,
+    CommandRecord, EventRecord, InboundCommit, MarkOutboundWritten, MarkTransmissionWritten,
+    OutboundCommit, OutboundRange, ResyncInboundCommit, StoreHandle, StoreOp, StoreReply,
     TransmissionCommit,
 };
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,9 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, split};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio::time::{Duration, Instant, MissedTickBehavior};
+use tokio::time::{Duration, Instant};
+
+pub use logging::SessionLogger;
 
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
@@ -25,7 +27,9 @@ pub struct SessionConfig {
     pub sender_comp_id: String,
     pub target_comp_id: String,
     pub heartbeat_interval_secs: u64,
-    pub default_appl_ver_id: Option<String>,
+    /// Send Logon with 141=Y and reset both sequence counters to 1
+    /// (QuickFIX ResetSeqNumFlag=Y semantics).
+    pub reset_on_logon: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -259,50 +263,40 @@ pub fn spawn_initiator<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    spawn_initiator_internal(io, config, None, Vec::new(), store, time_source)
-}
-
-pub fn spawn_initiator_with_dictionary<T>(
-    io: T,
-    config: SessionConfig,
-    dictionary: Arc<CompiledDictionary>,
-    store: StoreHandle,
-    time_source: Arc<dyn TimeSource>,
-) -> SessionHandle
-where
-    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    spawn_initiator_internal(io, config, Some(dictionary), Vec::new(), store, time_source)
-}
-
-pub fn spawn_initiator_with_dictionary_and_logon_fields<T>(
-    io: T,
-    config: SessionConfig,
-    dictionary: Arc<CompiledDictionary>,
-    logon_fields: Vec<Field>,
-    store: StoreHandle,
-    time_source: Arc<dyn TimeSource>,
-) -> SessionHandle
-where
-    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
     spawn_initiator_internal(
         io,
         config,
-        Some(dictionary),
-        logon_fields,
+        Vec::new(),
         store,
         time_source,
+        SessionLogger::disabled(),
     )
+}
+
+/// Same as [`spawn_initiator`], but sends custom Logon fields and records
+/// every inbound/outbound wire message and session event to QuickFIX-style
+/// log files. Messages are parsed structurally by tag only.
+pub fn spawn_initiator_logged<T>(
+    io: T,
+    config: SessionConfig,
+    logon_fields: Vec<Field>,
+    store: StoreHandle,
+    time_source: Arc<dyn TimeSource>,
+    logger: SessionLogger,
+) -> SessionHandle
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    spawn_initiator_internal(io, config, logon_fields, store, time_source, logger)
 }
 
 fn spawn_initiator_internal<T>(
     io: T,
     config: SessionConfig,
-    dictionary: Option<Arc<CompiledDictionary>>,
     logon_fields: Vec<Field>,
     store: StoreHandle,
     time_source: Arc<dyn TimeSource>,
+    logger: SessionLogger,
 ) -> SessionHandle
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -329,6 +323,7 @@ where
             store,
             time_source,
             writer,
+            logger,
             commands: commands_rx,
             events,
             phase: SessionPhase::Connecting,
@@ -336,10 +331,6 @@ where
             next_in: recovery.next_in,
             next_event: recovery.next_event,
             decoder: FrameDecoder::new(1024 * 1024),
-            parse_dictionary: dictionary
-                .as_ref()
-                .map_or_else(ParseDictionary::new, |value| value.parse_dictionary()),
-            dictionary,
             logon_fields,
             gap_buffer: BTreeMap::new(),
             last_outbound: Instant::now(),
@@ -347,7 +338,10 @@ where
             test_request: None,
         };
 
-        if let Err(error) = actor.run(reader).await {
+        let run_result = actor.run(reader).await;
+        actor.logger.info("Disconnecting");
+        if let Err(error) = run_result {
+            actor.logger.error(format!("{error}"));
             actor.phase = SessionPhase::Blocked;
             let _ = actor
                 .events
@@ -373,13 +367,12 @@ struct SessionActor<W> {
     next_in: u64,
     next_event: u64,
     decoder: FrameDecoder,
-    parse_dictionary: ParseDictionary,
-    dictionary: Option<Arc<CompiledDictionary>>,
     logon_fields: Vec<Field>,
     gap_buffer: BTreeMap<u64, Bytes>,
     last_outbound: Instant,
     last_inbound: Instant,
     test_request: Option<TestRequestOutstanding>,
+    logger: SessionLogger,
 }
 
 struct TestRequestOutstanding {
@@ -399,9 +392,6 @@ where
         self.set_phase(SessionPhase::LogonSent);
         let mut input = vec![0_u8; 8192];
         let heartbeat_interval = Duration::from_secs(self.config.heartbeat_interval_secs.max(1));
-        let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
-        heartbeat_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        heartbeat_timer.tick().await;
 
         loop {
             tokio::select! {
@@ -422,13 +412,15 @@ where
                         .ingest(&input[..count])
                         .map_err(|error| SessionError::Codec(error.to_string()))?;
                     for frame in frames {
+                        self.logger.incoming(&frame);
                         self.handle_inbound(&frame).await?;
                     }
                 }
-                _ = heartbeat_timer.tick() => {
-                    if self.phase == SessionPhase::Established
-                        && self.last_outbound.elapsed() >= heartbeat_interval
-                    {
+                // Sleep until the exact heartbeat due point (last outbound +
+                // interval). Recomputed every iteration, so a send that lands
+                // between ticks can never stretch the gap past the interval.
+                _ = tokio::time::sleep_until(self.last_outbound + heartbeat_interval) => {
+                    if self.phase == SessionPhase::Established {
                         self.send_heartbeat().await?;
                     }
                     if let Some(outstanding) = &self.test_request {
@@ -498,17 +490,31 @@ where
 
     async fn send_logon(&mut self) -> Result<(), SessionError> {
         validate_custom_logon_fields(&self.logon_fields)?;
+        if self.config.reset_on_logon {
+            let reply = self
+                .store
+                .apply(StoreOp::ResetSequences)
+                .await
+                .map_err(|error| SessionError::Store(error.to_string()))?;
+            let StoreReply::SequencesReset(next_event) = reply else {
+                return Err(SessionError::Store(
+                    "sequence reset returned the wrong record type".to_owned(),
+                ));
+            };
+            self.next_out = 1;
+            self.next_in = 1;
+            self.next_event = next_event;
+            self.logger
+                .info("Resetting sequence numbers to 1 (ResetSeqNumFlag=Y)");
+        }
         let mut fields = self.standard_header("A");
         fields.push(Field::new(98, Bytes::from_static(b"0")));
         fields.push(Field::new(
             108,
             Bytes::from(self.config.heartbeat_interval_secs.to_string()),
         ));
-        if let Some(default_appl_ver_id) = &self.config.default_appl_ver_id {
-            fields.push(Field::new(
-                1137,
-                Bytes::copy_from_slice(default_appl_ver_id.as_bytes()),
-            ));
+        if self.config.reset_on_logon {
+            fields.push(Field::new(141, Bytes::from_static(b"Y")));
         }
         fields.extend(self.logon_fields.iter().cloned());
 
@@ -524,11 +530,10 @@ where
             })
             .collect::<Vec<_>>();
         let journal_wire = self.encode_outbound(&journal_fields)?;
-        let request_id = format!("session:logon:{}", self.next_out);
-        let audit = AuditEvent {
-            kind: "session_logon_journaled".to_owned(),
-            details: BTreeMap::from([("msg_seq_num".to_owned(), self.next_out.to_string())]),
-        };
+        // The event counter survives sequence resets, keeping this idempotency
+        // key unique across ResetSeqNumFlag=Y epochs (the same next_out would
+        // otherwise collide with a previous epoch's Logon record).
+        let request_id = format!("session:logon:{}:{}", self.next_out, self.next_event);
         let reply = self
             .store
             .apply(StoreOp::CommitOutbound(OutboundCommit {
@@ -537,7 +542,6 @@ where
                 cl_ord_id: String::new(),
                 msg_seq_num: self.next_out,
                 wire: journal_wire.to_vec(),
-                audit,
             }))
             .await
             .map_err(|error| SessionError::Store(error.to_string()))?;
@@ -547,23 +551,12 @@ where
             ));
         };
 
-        self.writer
-            .write_all(&wire)
-            .await
-            .map_err(|error| SessionError::Transport(error.to_string()))?;
-        self.writer
-            .flush()
-            .await
-            .map_err(|error| SessionError::Transport(error.to_string()))?;
-        self.last_outbound = Instant::now();
+        self.write_wire(&wire).await?;
+        self.logger.info("Sent logon request");
         self.store
             .apply(StoreOp::MarkOutboundWritten(MarkOutboundWritten {
                 request_id,
                 msg_seq_num: command.msg_seq_num,
-                audit: AuditEvent {
-                    kind: "session_logon_written".to_owned(),
-                    details: BTreeMap::new(),
-                },
             }))
             .await
             .map_err(|error| SessionError::Store(error.to_string()))?;
@@ -595,10 +588,37 @@ where
                 self.verify_possdup(&message, msg_seq_num).await?;
                 return Ok(());
             }
-            return Err(SessionError::Protocol(format!(
-                "expected inbound sequence {}, got {msg_seq_num}",
-                self.next_in
-            )));
+            // The Logon response realigns a stale local expectation (the
+            // venue restarted and reset its outbound sequence); see
+            // commit_expected for the matching branch.
+            if self.phase == SessionPhase::LogonSent {
+                self.logger.info(format!(
+                    "sequence desync at logon: expected {}, got {msg_seq_num}; realigning to counterparty",
+                    self.next_in
+                ));
+                let details = BTreeMap::from([
+                    ("expected".to_owned(), self.next_in.to_string()),
+                    ("realign_to".to_owned(), msg_seq_num.to_string()),
+                ]);
+                self.store
+                    .apply(StoreOp::ResyncInbound(ResyncInboundCommit {
+                        next_in_after: msg_seq_num,
+                        event: EventRecord {
+                            id: self.next_event,
+                            kind: "sequence_resync".to_owned(),
+                            details: details.clone(),
+                        },
+                    }))
+                    .await
+                    .map_err(|error| SessionError::Store(error.to_string()))?;
+                self.next_event += 1;
+                self.next_in = msg_seq_num;
+            } else {
+                return Err(SessionError::Protocol(format!(
+                    "expected inbound sequence {}, got {msg_seq_num}",
+                    self.next_in
+                )));
+            }
         }
 
         self.commit_expected(message, frame).await?;
@@ -650,8 +670,8 @@ where
                 "PossDup sequence {msg_seq_num} has no committed original"
             )));
         };
-        let original = parse_frame(&original.wire, &self.parse_dictionary)
-            .map_err(|error| SessionError::Codec(error.to_string()))?;
+        let original =
+            parse_frame(&original.wire).map_err(|error| SessionError::Codec(error.to_string()))?;
         let original_sending_time = required_value(&original, 52)?;
         if original_sending_time != orig_sending_time
             || original.begin_string != replay.begin_string
@@ -665,8 +685,7 @@ where
     }
 
     fn parse_inbound(&self, frame: &[u8]) -> Result<ParsedMessage, SessionError> {
-        let message = parse_frame(frame, &self.parse_dictionary)
-            .map_err(|error| SessionError::Codec(error.to_string()))?;
+        let message = parse_frame(frame).map_err(|error| SessionError::Codec(error.to_string()))?;
         if message.begin_string.as_ref() != self.config.begin_string.as_bytes() {
             return Err(SessionError::Protocol("BeginString mismatch".to_owned()));
         }
@@ -690,11 +709,6 @@ where
                 field.tag
             )));
         }
-        if let Some(dictionary) = &self.dictionary {
-            dictionary
-                .validate(message.clone())
-                .map_err(|error| SessionError::Protocol(error.to_string()))?;
-        }
         Ok(message)
     }
 
@@ -704,11 +718,24 @@ where
         frame: &[u8],
     ) -> Result<(), SessionError> {
         let msg_seq_num = required_u64(&message, 34)?;
+        // The Logon response is the counterparty's authoritative sequence
+        // announcement. If it diverges from our expectation (the venue was
+        // restarted, or our journal is fresher than the venue), realign to it
+        // exactly once instead of failing the session; every later mismatch
+        // stays fatal.
+        let mut realigned = false;
         if msg_seq_num != self.next_in {
-            return Err(SessionError::Protocol(format!(
-                "expected inbound sequence {}, got {msg_seq_num}",
+            if self.phase != SessionPhase::LogonSent {
+                return Err(SessionError::Protocol(format!(
+                    "expected inbound sequence {}, got {msg_seq_num}",
+                    self.next_in
+                )));
+            }
+            self.logger.info(format!(
+                "sequence desync at logon: expected {}, got {msg_seq_num}; realigning to counterparty",
                 self.next_in
-            )));
+            ));
+            realigned = true;
         }
         let msg_type = message
             .msg_type()
@@ -739,6 +766,7 @@ where
                 )));
             }
         }
+        let baseline = if realigned { msg_seq_num } else { self.next_in };
         let next_in_after = if msg_type == "4" {
             if required_value(&message, 123)? != b"Y" {
                 return Err(SessionError::Protocol(
@@ -746,15 +774,14 @@ where
                 ));
             }
             let new_seq_num = required_u64(&message, 36)?;
-            if new_seq_num <= self.next_in {
+            if new_seq_num <= baseline {
                 return Err(SessionError::Protocol(format!(
-                    "SequenceReset NewSeqNo {new_seq_num} must be greater than {}",
-                    self.next_in
+                    "SequenceReset NewSeqNo {new_seq_num} must be greater than {baseline}",
                 )));
             }
             new_seq_num
         } else {
-            self.next_in + 1
+            msg_seq_num + 1
         };
 
         self.store
@@ -771,13 +798,6 @@ where
                         ("msg_seq_num".to_owned(), msg_seq_num.to_string()),
                     ]),
                 },
-                audit: AuditEvent {
-                    kind: "inbound_committed".to_owned(),
-                    details: BTreeMap::from([
-                        ("msg_type".to_owned(), msg_type.clone()),
-                        ("msg_seq_num".to_owned(), msg_seq_num.to_string()),
-                    ]),
-                },
             }))
             .await
             .map_err(|error| SessionError::Store(error.to_string()))?;
@@ -785,6 +805,7 @@ where
         self.next_event += 1;
 
         if msg_type == "A" && self.phase == SessionPhase::LogonSent {
+            self.logger.info("Received logon response");
             self.set_phase(SessionPhase::Established);
         }
         if msg_type == "0"
@@ -795,6 +816,7 @@ where
             self.test_request = None;
         }
         if msg_type == "5" {
+            self.logger.info("Received logout request");
             if self.phase != SessionPhase::LogoutSent {
                 self.send_logout(None).await?;
             }
@@ -815,7 +837,10 @@ where
         fields.push(Field::new(7, Bytes::from(begin_seq_num.to_string())));
         fields.push(Field::new(16, Bytes::from_static(b"0")));
         let wire = self.encode_outbound(&fields)?;
-        let request_id = format!("session:resend-request:{}", self.next_out);
+        let request_id = format!(
+            "session:resend-request:{}:{}",
+            self.next_out, self.next_event
+        );
         let reply = self
             .store
             .apply(StoreOp::CommitOutbound(OutboundCommit {
@@ -824,13 +849,6 @@ where
                 cl_ord_id: String::new(),
                 msg_seq_num: self.next_out,
                 wire: wire.to_vec(),
-                audit: AuditEvent {
-                    kind: "resend_request_journaled".to_owned(),
-                    details: BTreeMap::from([
-                        ("msg_seq_num".to_owned(), self.next_out.to_string()),
-                        ("begin_seq_num".to_owned(), begin_seq_num.to_string()),
-                    ]),
-                },
             }))
             .await
             .map_err(|error| SessionError::Store(error.to_string()))?;
@@ -840,8 +858,22 @@ where
             ));
         };
 
+        self.write_wire(&wire).await?;
+        self.store
+            .apply(StoreOp::MarkOutboundWritten(MarkOutboundWritten {
+                request_id,
+                msg_seq_num: command.msg_seq_num,
+            }))
+            .await
+            .map_err(|error| SessionError::Store(error.to_string()))?;
+        self.next_out = command.msg_seq_num + 1;
+        Ok(())
+    }
+
+    async fn write_wire(&mut self, wire: &[u8]) -> Result<(), SessionError> {
+        self.logger.outgoing(wire);
         self.writer
-            .write_all(&wire)
+            .write_all(wire)
             .await
             .map_err(|error| SessionError::Transport(error.to_string()))?;
         self.writer
@@ -849,18 +881,6 @@ where
             .await
             .map_err(|error| SessionError::Transport(error.to_string()))?;
         self.last_outbound = Instant::now();
-        self.store
-            .apply(StoreOp::MarkOutboundWritten(MarkOutboundWritten {
-                request_id,
-                msg_seq_num: command.msg_seq_num,
-                audit: AuditEvent {
-                    kind: "resend_request_written".to_owned(),
-                    details: BTreeMap::new(),
-                },
-            }))
-            .await
-            .map_err(|error| SessionError::Store(error.to_string()))?;
-        self.next_out = command.msg_seq_num + 1;
         Ok(())
     }
 
@@ -894,13 +914,25 @@ where
         }
 
         let mut fields = self.standard_header(&request.msg_type);
+        let requires_transact_time = matches!(request.msg_type.as_str(), "D" | "G");
+        let mut body = request.fields.into_iter().peekable();
+        if matches!(request.msg_type.as_str(), "F" | "G") {
+            // FIX44.xml places OrigClOrdID(41) before ClOrdID(11).
+            match body.peek().map(|field| field.tag) {
+                Some(41) => fields.push(body.next().expect("peeked")),
+                _ => {
+                    return Err(SessionError::InvalidApplication(
+                        "F/G requires OrigClOrdID(41) as the first field".to_owned(),
+                    ));
+                }
+            }
+        }
         fields.push(Field::new(
             11,
             Bytes::copy_from_slice(request.cl_ord_id.as_bytes()),
         ));
-        let requires_transact_time = matches!(request.msg_type.as_str(), "D" | "F" | "G");
         let mut transact_time_added = false;
-        for field in request.fields {
+        for field in body {
             let is_side = field.tag == 54;
             fields.push(field);
             if requires_transact_time && is_side {
@@ -922,14 +954,6 @@ where
                 cl_ord_id: request.cl_ord_id,
                 msg_seq_num: self.next_out,
                 wire: wire.to_vec(),
-                audit: AuditEvent {
-                    kind: "application_journaled".to_owned(),
-                    details: BTreeMap::from([
-                        ("request_id".to_owned(), request.request_id.clone()),
-                        ("msg_type".to_owned(), request.msg_type),
-                        ("msg_seq_num".to_owned(), self.next_out.to_string()),
-                    ]),
-                },
             }))
             .await
             .map_err(|error| SessionError::Store(error.to_string()))?;
@@ -949,27 +973,12 @@ where
             )));
         }
 
-        self.writer
-            .write_all(&wire)
-            .await
-            .map_err(|error| SessionError::Transport(error.to_string()))?;
-        self.writer
-            .flush()
-            .await
-            .map_err(|error| SessionError::Transport(error.to_string()))?;
-        self.last_outbound = Instant::now();
+        self.write_wire(&wire).await?;
         let reply = self
             .store
             .apply(StoreOp::MarkOutboundWritten(MarkOutboundWritten {
                 request_id: request.request_id,
                 msg_seq_num: command.msg_seq_num,
-                audit: AuditEvent {
-                    kind: "application_written".to_owned(),
-                    details: BTreeMap::from([(
-                        "msg_seq_num".to_owned(),
-                        command.msg_seq_num.to_string(),
-                    )]),
-                },
             }))
             .await
             .map_err(|error| SessionError::Store(error.to_string()))?;
@@ -995,7 +1004,7 @@ where
             fields.push(Field::new(112, Bytes::copy_from_slice(test_request_id)));
         }
         let wire = self.encode_outbound(&fields)?;
-        let request_id = format!("session:heartbeat:{}", self.next_out);
+        let request_id = format!("session:heartbeat:{}:{}", self.next_out, self.next_event);
         let reply = self
             .store
             .apply(StoreOp::CommitOutbound(OutboundCommit {
@@ -1004,18 +1013,6 @@ where
                 cl_ord_id: String::new(),
                 msg_seq_num: self.next_out,
                 wire: wire.to_vec(),
-                audit: AuditEvent {
-                    kind: "heartbeat_journaled".to_owned(),
-                    details: BTreeMap::from([
-                        ("msg_seq_num".to_owned(), self.next_out.to_string()),
-                        (
-                            "test_req_id".to_owned(),
-                            test_request_id.map_or_else(String::new, |value| {
-                                String::from_utf8_lossy(value).into_owned()
-                            }),
-                        ),
-                    ]),
-                },
             }))
             .await
             .map_err(|error| SessionError::Store(error.to_string()))?;
@@ -1024,23 +1021,11 @@ where
                 "heartbeat commit returned the wrong record type".to_owned(),
             ));
         };
-        self.writer
-            .write_all(&wire)
-            .await
-            .map_err(|error| SessionError::Transport(error.to_string()))?;
-        self.writer
-            .flush()
-            .await
-            .map_err(|error| SessionError::Transport(error.to_string()))?;
-        self.last_outbound = Instant::now();
+        self.write_wire(&wire).await?;
         self.store
             .apply(StoreOp::MarkOutboundWritten(MarkOutboundWritten {
                 request_id,
                 msg_seq_num: command.msg_seq_num,
-                audit: AuditEvent {
-                    kind: "heartbeat_written".to_owned(),
-                    details: BTreeMap::new(),
-                },
             }))
             .await
             .map_err(|error| SessionError::Store(error.to_string()))?;
@@ -1056,7 +1041,7 @@ where
             Bytes::copy_from_slice(test_req_id.as_bytes()),
         ));
         let wire = self.encode_outbound(&fields)?;
-        let request_id = format!("session:test-request:{}", self.next_out);
+        let request_id = format!("session:test-request:{}:{}", self.next_out, self.next_event);
         let reply = self
             .store
             .apply(StoreOp::CommitOutbound(OutboundCommit {
@@ -1065,13 +1050,6 @@ where
                 cl_ord_id: String::new(),
                 msg_seq_num: self.next_out,
                 wire: wire.to_vec(),
-                audit: AuditEvent {
-                    kind: "test_request_journaled".to_owned(),
-                    details: BTreeMap::from([
-                        ("msg_seq_num".to_owned(), self.next_out.to_string()),
-                        ("test_req_id".to_owned(), test_req_id.clone()),
-                    ]),
-                },
             }))
             .await
             .map_err(|error| SessionError::Store(error.to_string()))?;
@@ -1080,23 +1058,11 @@ where
                 "TestRequest commit returned the wrong record type".to_owned(),
             ));
         };
-        self.writer
-            .write_all(&wire)
-            .await
-            .map_err(|error| SessionError::Transport(error.to_string()))?;
-        self.writer
-            .flush()
-            .await
-            .map_err(|error| SessionError::Transport(error.to_string()))?;
-        self.last_outbound = Instant::now();
+        self.write_wire(&wire).await?;
         self.store
             .apply(StoreOp::MarkOutboundWritten(MarkOutboundWritten {
                 request_id,
                 msg_seq_num: command.msg_seq_num,
-                audit: AuditEvent {
-                    kind: "test_request_written".to_owned(),
-                    details: BTreeMap::new(),
-                },
             }))
             .await
             .map_err(|error| SessionError::Store(error.to_string()))?;
@@ -1123,7 +1089,7 @@ where
             fields.push(Field::new(58, Bytes::from(text)));
         }
         let wire = self.encode_outbound(&fields)?;
-        let request_id = format!("session:logout:{}", self.next_out);
+        let request_id = format!("session:logout:{}:{}", self.next_out, self.next_event);
         let reply = self
             .store
             .apply(StoreOp::CommitOutbound(OutboundCommit {
@@ -1132,13 +1098,6 @@ where
                 cl_ord_id: String::new(),
                 msg_seq_num: self.next_out,
                 wire: wire.to_vec(),
-                audit: AuditEvent {
-                    kind: "logout_journaled".to_owned(),
-                    details: BTreeMap::from([(
-                        "msg_seq_num".to_owned(),
-                        self.next_out.to_string(),
-                    )]),
-                },
             }))
             .await
             .map_err(|error| SessionError::Store(error.to_string()))?;
@@ -1147,23 +1106,11 @@ where
                 "Logout commit returned the wrong record type".to_owned(),
             ));
         };
-        self.writer
-            .write_all(&wire)
-            .await
-            .map_err(|error| SessionError::Transport(error.to_string()))?;
-        self.writer
-            .flush()
-            .await
-            .map_err(|error| SessionError::Transport(error.to_string()))?;
-        self.last_outbound = Instant::now();
+        self.write_wire(&wire).await?;
         self.store
             .apply(StoreOp::MarkOutboundWritten(MarkOutboundWritten {
                 request_id,
                 msg_seq_num: command.msg_seq_num,
-                audit: AuditEvent {
-                    kind: "logout_written".to_owned(),
-                    details: BTreeMap::new(),
-                },
             }))
             .await
             .map_err(|error| SessionError::Store(error.to_string()))?;
@@ -1235,8 +1182,7 @@ where
     }
 
     async fn write_application_replay(&mut self, wire: &[u8]) -> Result<(), SessionError> {
-        let original = parse_frame(wire, &ParseDictionary::new())
-            .map_err(|error| SessionError::Codec(error.to_string()))?;
+        let original = parse_frame(wire).map_err(|error| SessionError::Codec(error.to_string()))?;
         let msg_seq_num = required_u64(&original, 34)?;
         let original_sending_time = required_value(&original, 52)?.to_vec();
         let mut replay_fields = Vec::with_capacity(original.fields.len() + 2);
@@ -1300,10 +1246,6 @@ where
                 msg_seq_num,
                 kind: kind.to_owned(),
                 wire: wire.to_vec(),
-                audit: AuditEvent {
-                    kind: format!("{kind}_journaled"),
-                    details: BTreeMap::from([("msg_seq_num".to_owned(), msg_seq_num.to_string())]),
-                },
             }))
             .await
             .map_err(|error| SessionError::Store(error.to_string()))?;
@@ -1313,22 +1255,10 @@ where
             ));
         };
 
-        self.writer
-            .write_all(&wire)
-            .await
-            .map_err(|error| SessionError::Transport(error.to_string()))?;
-        self.writer
-            .flush()
-            .await
-            .map_err(|error| SessionError::Transport(error.to_string()))?;
-        self.last_outbound = Instant::now();
+        self.write_wire(&wire).await?;
         self.store
             .apply(StoreOp::MarkTransmissionWritten(MarkTransmissionWritten {
                 id: transmission.id,
-                audit: AuditEvent {
-                    kind: format!("{kind}_written"),
-                    details: BTreeMap::from([("msg_seq_num".to_owned(), msg_seq_num.to_string())]),
-                },
             }))
             .await
             .map_err(|error| SessionError::Store(error.to_string()))?;
@@ -1352,25 +1282,12 @@ where
     }
 
     fn encode_outbound(&self, fields: &[Field]) -> Result<Bytes, SessionError> {
-        let wire = encode_message(self.config.begin_string.as_bytes(), fields)
-            .map_err(|error| SessionError::Codec(error.to_string()))?;
-        if let Some(dictionary) = &self.dictionary {
-            let message = parse_frame(&wire, &self.parse_dictionary)
-                .map_err(|error| SessionError::Codec(error.to_string()))?;
-            dictionary
-                .validate(message)
-                .map_err(|error| SessionError::Protocol(error.to_string()))?;
-        }
-        Ok(wire)
+        encode_message(self.config.begin_string.as_bytes(), fields)
+            .map_err(|error| SessionError::Codec(error.to_string()))
     }
 
     fn is_sensitive_tag(&self, tag: u32) -> bool {
-        matches!(tag, 553 | 554 | 925)
-            || self.logon_fields.iter().any(|field| field.tag == tag)
-            || self
-                .dictionary
-                .as_ref()
-                .is_some_and(|dictionary| dictionary.sensitive_tags.contains(&tag))
+        matches!(tag, 553 | 554 | 925) || self.logon_fields.iter().any(|field| field.tag == tag)
     }
 
     fn set_phase(&mut self, phase: SessionPhase) {

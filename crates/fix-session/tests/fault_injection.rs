@@ -4,19 +4,17 @@ use fix_session::{
     ApplicationRequest, SessionConfig, SessionError, SessionPhase, StaticTimeSource,
     spawn_initiator,
 };
-use fix_store::{
-    MemoryStore, RecoveryState, StoreError, StoreOp, StorePort, StoreReply, StoreWorker,
-};
+use fix_store::{RecoveryState, StoreError, StoreOp, StorePort, StoreReply};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::time::{Duration, timeout};
 
 struct FailApplicationJournal {
-    inner: MemoryStore,
+    inner: fix_store::RedbStore,
 }
 
 struct FailReplayJournal {
-    inner: MemoryStore,
+    inner: fix_store::RedbStore,
 }
 
 impl StorePort for FailReplayJournal {
@@ -62,11 +60,9 @@ async fn injected_journal_failure_prevents_any_application_socket_write() {
             sender_comp_id: "CLIENT".to_owned(),
             target_comp_id: "SERVER".to_owned(),
             heartbeat_interval_secs: 30,
-            default_appl_ver_id: None,
+            reset_on_logon: false,
         },
-        StoreWorker::spawn(FailApplicationJournal {
-            inner: MemoryStore::new(b"fault-injection-audit-key"),
-        }),
+        fix_store::StoreWorker::spawn(FailApplicationJournal { inner: test_redb() }),
         Arc::new(StaticTimeSource::new("20260726-15:00:00.000")),
     );
     let mut bytes = vec![0_u8; 16 * 1024];
@@ -157,11 +153,9 @@ async fn injected_replay_journal_failure_prevents_replay_socket_write() {
             sender_comp_id: "CLIENT".to_owned(),
             target_comp_id: "SERVER".to_owned(),
             heartbeat_interval_secs: 30,
-            default_appl_ver_id: None,
+            reset_on_logon: false,
         },
-        StoreWorker::spawn(FailReplayJournal {
-            inner: MemoryStore::new(b"replay-fault-audit-key"),
-        }),
+        fix_store::StoreWorker::spawn(FailReplayJournal { inner: test_redb() }),
         Arc::new(StaticTimeSource::new("20260726-15:00:00.000")),
     );
     let mut bytes = vec![0_u8; 32 * 1024];
@@ -259,4 +253,8 @@ async fn injected_replay_journal_failure_prevents_replay_socket_write() {
         ),
         "replay bytes were written before their transmission journal"
     );
+}
+
+fn test_redb() -> fix_store::RedbStore {
+    fix_store::RedbStore::open_in_memory()
 }

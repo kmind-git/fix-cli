@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use fixd::{run_daemon, validate_daemon_files};
+use fixd::quickfix::run_quickfix_daemon;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -11,36 +11,29 @@ struct Arguments {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Run {
+    /// Connect to a FIX venue described by a QuickFIX-style cfg
+    /// (tag-only parsing, no data dictionary).
+    RunReal {
         #[arg(long)]
-        profile: PathBuf,
-    },
-    Validate {
+        cfg: PathBuf,
+        /// Directory for QuickFIX-style Messages/Event log files
+        /// (default: cfg FileLogPath, else "logs").
         #[arg(long)]
-        profile: PathBuf,
-    },
-    Schema {
+        log_dir: Option<PathBuf>,
+        /// Journal database (default: data/{sender}-{target}.redb).
         #[arg(long)]
-        output: Option<PathBuf>,
+        database: Option<PathBuf>,
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Arguments::parse().command {
-        Command::Run { profile } => run_daemon(profile).await?,
-        Command::Validate { profile } => {
-            validate_daemon_files(&profile)?;
-            println!("{{\"ok\":true}}");
-        }
-        Command::Schema { output } => {
-            let schema = serde_json::to_vec_pretty(&fix_control::control_request_schema())?;
-            if let Some(output) = output {
-                std::fs::write(output, schema)?;
-            } else {
-                println!("{}", String::from_utf8(schema)?);
-            }
-        }
+        Command::RunReal {
+            cfg,
+            log_dir,
+            database,
+        } => run_quickfix_daemon(&cfg, log_dir.as_deref(), database).await?,
     }
     Ok(())
 }

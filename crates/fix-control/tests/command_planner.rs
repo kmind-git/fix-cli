@@ -3,7 +3,6 @@ use fix_control::{
     PlannedCommand, Policy, RuntimeMode, Side, TimeInForce,
 };
 use rust_decimal::Decimal;
-use std::collections::BTreeSet;
 use std::str::FromStr;
 
 #[test]
@@ -12,7 +11,6 @@ fn dry_run_new_order_is_policy_checked_and_mapped_to_a_d_message() {
         "broker-a-uat",
         RuntimeMode::Certification,
         Policy {
-            allowed_symbols: BTreeSet::from(["IBM".to_owned()]),
             max_quantity: Decimal::from(1_000),
             max_notional: Decimal::from_str("1000000").expect("decimal"),
             allow_market_orders: false,
@@ -26,11 +24,16 @@ fn dry_run_new_order_is_policy_checked_and_mapped_to_a_d_message() {
         execution_mode: ExecutionMode::DryRun,
         command: Command::NewOrderSingle(NewOrderSingle {
             symbol: "IBM".to_owned(),
+            account: "110853".to_owned(),
+            security_exchange: "XSGE".to_owned(),
+            security_group: "FUT".to_owned(),
             side: Side::Buy,
             quantity: "100".to_owned(),
             order_type: OrderType::Limit,
             price: Some("187.25".to_owned()),
             time_in_force: TimeInForce::Day,
+            maturity_month_year: None,
+            extra_tags: Vec::new(),
         }),
         auth: None,
     };
@@ -108,15 +111,14 @@ fn live_runtime_still_rejects_unimplemented_capability_proofs() {
 }
 
 #[test]
-fn market_orders_fail_closed_even_if_a_legacy_policy_flag_is_true() {
+fn priceless_market_orders_are_accepted_and_omit_price() {
     let planner = CommandPlanner::new(
         "broker-a-uat",
         RuntimeMode::Certification,
         Policy {
-            allowed_symbols: BTreeSet::from(["IBM".to_owned()]),
             max_quantity: Decimal::from(1_000),
             max_notional: Decimal::from(1_000_000),
-            allow_market_orders: true,
+            allow_market_orders: false,
             max_messages_per_second: 10,
         },
     );
@@ -127,20 +129,28 @@ fn market_orders_fail_closed_even_if_a_legacy_policy_flag_is_true() {
         execution_mode: ExecutionMode::Certification,
         command: Command::NewOrderSingle(NewOrderSingle {
             symbol: "IBM".to_owned(),
+            account: "110853".to_owned(),
+            security_exchange: "XSGE".to_owned(),
+            security_group: "FUT".to_owned(),
             side: Side::Buy,
             quantity: "10".to_owned(),
             order_type: OrderType::Market,
             price: None,
             time_in_force: TimeInForce::Day,
+            maturity_month_year: None,
+            extra_tags: Vec::new(),
         }),
         auth: None,
     };
 
-    let error = planner
+    let planned = planner
         .plan(&request)
-        .expect_err("market order lacks bounded notional");
+        .expect("priceless market order plans");
 
-    assert_eq!(error.code(), "POLICY_DENIED");
+    let PlannedCommand::Application(application) = planned else {
+        panic!("market order must plan to an application command");
+    };
+    assert!(!application.fields.iter().any(|field| field.tag == 44));
 }
 
 #[test]

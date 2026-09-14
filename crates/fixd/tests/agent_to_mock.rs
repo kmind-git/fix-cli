@@ -1,13 +1,10 @@
 use fix_control::{
     Command, CommandPlanner, ControlRequest, ControlService, ExecutionMode, NewOrderSingle,
-    OrderType, Policy, RuntimeMode, Side, TimeInForce,
+    OrderType, Policy, RuntimeMode, SessionSlot, Side, TimeInForce,
 };
 use fix_mock::{MockConfig, run_mock_session};
-use fix_protocol::{CompiledDictionary, MemberDefinition, MessageDefinition};
-use fix_session::{SessionConfig, SessionPhase, StaticTimeSource, spawn_initiator_with_dictionary};
-use fix_store::{MemoryStore, StoreWorker};
+use fix_session::{SessionConfig, SessionPhase, StaticTimeSource, spawn_initiator};
 use rust_decimal::Decimal;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, timeout};
@@ -36,18 +33,16 @@ async fn agent_control_request_reaches_mock_venue_and_receives_execution_report(
     let stream = TcpStream::connect(address)
         .await
         .expect("connect mock venue");
-    let dictionary = Arc::new(test_dictionary());
-    let store = StoreWorker::spawn(MemoryStore::new(b"integration-audit-key"));
-    let session = spawn_initiator_with_dictionary(
+    let store = test_store();
+    let session = spawn_initiator(
         stream,
         SessionConfig {
             begin_string: "FIX.4.4".to_owned(),
             sender_comp_id: "CLIENT".to_owned(),
             target_comp_id: "SERVER".to_owned(),
             heartbeat_interval_secs: 30,
-            default_appl_ver_id: None,
+            reset_on_logon: false,
         },
-        dictionary,
         store,
         Arc::new(StaticTimeSource::new("20260726-15:00:00.000")),
     );
@@ -66,14 +61,13 @@ async fn agent_control_request_reaches_mock_venue_and_receives_execution_report(
         "broker-a-uat",
         RuntimeMode::Certification,
         Policy {
-            allowed_symbols: BTreeSet::from(["IBM".to_owned()]),
             max_quantity: Decimal::from(1_000),
             max_notional: Decimal::from(1_000_000),
             allow_market_orders: false,
             max_messages_per_second: 10,
         },
     );
-    let service = ControlService::new(planner, session.clone());
+    let service = ControlService::new_dynamic(planner, SessionSlot::with_session(session.clone()));
     let response = service
         .execute(ControlRequest {
             version: 1,
@@ -82,11 +76,16 @@ async fn agent_control_request_reaches_mock_venue_and_receives_execution_report(
             execution_mode: ExecutionMode::Certification,
             command: Command::NewOrderSingle(NewOrderSingle {
                 symbol: "IBM".to_owned(),
+                account: "110853".to_owned(),
+                security_exchange: "XSGE".to_owned(),
+                security_group: "FUT".to_owned(),
                 side: Side::Buy,
                 quantity: "100".to_owned(),
                 order_type: OrderType::Limit,
                 price: Some("187.25".to_owned()),
                 time_in_force: TimeInForce::Day,
+                maturity_month_year: None,
+                extra_tags: Vec::new(),
             }),
             auth: None,
         })
@@ -119,61 +118,10 @@ async fn agent_control_request_reaches_mock_venue_and_receives_execution_report(
         .expect("mock task");
 }
 
-fn test_dictionary() -> CompiledDictionary {
-    let header = || {
-        vec![
-            MemberDefinition::field(49, true),
-            MemberDefinition::field(56, true),
-            MemberDefinition::field(34, true),
-            MemberDefinition::field(52, true),
-        ]
-    };
-    let mut logon = header();
-    logon.extend([
-        MemberDefinition::field(98, true),
-        MemberDefinition::field(108, true),
-    ]);
-    let mut order = header();
-    order.extend([
-        MemberDefinition::field(11, true),
-        MemberDefinition::field(21, true),
-        MemberDefinition::field(55, true),
-        MemberDefinition::field(54, true),
-        MemberDefinition::field(60, true),
-        MemberDefinition::field(38, true),
-        MemberDefinition::field(40, true),
-        MemberDefinition::field(44, false),
-        MemberDefinition::field(59, true),
-    ]);
-    let mut execution_report = header();
-    execution_report.extend([
-        MemberDefinition::field(37, true),
-        MemberDefinition::field(17, true),
-        MemberDefinition::field(150, true),
-        MemberDefinition::field(39, true),
-        MemberDefinition::field(11, true),
-        MemberDefinition::field(41, false),
-        MemberDefinition::field(55, true),
-        MemberDefinition::field(54, true),
-        MemberDefinition::field(151, true),
-        MemberDefinition::field(14, true),
-        MemberDefinition::field(6, true),
-    ]);
+fn test_store() -> fix_store::StoreHandle {
+    fix_store::StoreWorker::spawn(test_redb())
+}
 
-    CompiledDictionary::new("FIX.4.4")
-        .with_message(MessageDefinition {
-            name: "Logon".to_owned(),
-            msg_type: "A".to_owned(),
-            members: logon,
-        })
-        .with_message(MessageDefinition {
-            name: "NewOrderSingle".to_owned(),
-            msg_type: "D".to_owned(),
-            members: order,
-        })
-        .with_message(MessageDefinition {
-            name: "ExecutionReport".to_owned(),
-            msg_type: "8".to_owned(),
-            members: execution_report,
-        })
+fn test_redb() -> fix_store::RedbStore {
+    fix_store::RedbStore::open_in_memory()
 }

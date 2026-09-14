@@ -1,16 +1,12 @@
 #![forbid(unsafe_code)]
 
-use hmac::{Hmac, Mac};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::mpsc;
 use thiserror::Error;
 use tokio::sync::oneshot;
-
-type HmacSha256 = Hmac<Sha256>;
 
 const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const COMMAND_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("commands");
@@ -18,7 +14,6 @@ const OUTBOUND_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("outbou
 const TRANSMISSION_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("transmissions");
 const INBOUND_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("inbound");
 const EVENT_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("events");
-const AUDIT_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryState {
@@ -74,20 +69,6 @@ pub struct TransmissionRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuditEvent {
-    pub kind: String,
-    pub details: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuditRecord {
-    pub id: u64,
-    pub event: AuditEvent,
-    pub previous_hash: String,
-    pub hash: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EventRecord {
     pub id: u64,
     pub kind: String,
@@ -103,20 +84,24 @@ pub struct InboundRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResyncInboundCommit {
+    pub next_in_after: u64,
+    pub event: EventRecord,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutboundCommit {
     pub request_id: String,
     pub fingerprint: String,
     pub cl_ord_id: String,
     pub msg_seq_num: u64,
     pub wire: Vec<u8>,
-    pub audit: AuditEvent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarkOutboundWritten {
     pub request_id: String,
     pub msg_seq_num: u64,
-    pub audit: AuditEvent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,13 +109,11 @@ pub struct TransmissionCommit {
     pub msg_seq_num: u64,
     pub kind: String,
     pub wire: Vec<u8>,
-    pub audit: AuditEvent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarkTransmissionWritten {
     pub id: u64,
-    pub audit: AuditEvent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,7 +123,6 @@ pub struct InboundCommit {
     pub msg_type: String,
     pub wire: Vec<u8>,
     pub event: EventRecord,
-    pub audit: AuditEvent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,6 +138,8 @@ pub enum StoreOp {
     CommitTransmission(TransmissionCommit),
     MarkTransmissionWritten(MarkTransmissionWritten),
     CommitInbound(InboundCommit),
+    ResyncInbound(ResyncInboundCommit),
+    ResetSequences,
     LoadCommand(String),
     LoadOutboundRange(OutboundRange),
     LoadInbound(u64),
@@ -169,6 +153,10 @@ pub enum StoreReply {
     Transmission(TransmissionRecord),
     StoredTransmission(Option<TransmissionRecord>),
     Inbound(InboundRecord),
+    ResyncedInbound(u64),
+    /// Carries the post-reset `next_event`; every reset consumes one event
+    /// slot so admin idempotency keys stay unique across sequence epochs.
+    SequencesReset(u64),
     StoredInbound(Option<InboundRecord>),
     Outbound(Vec<OutboundRecord>),
 }
@@ -185,12 +173,6 @@ pub enum StoreError {
     EventSequenceMismatch { expected: u64, actual: u64 },
     #[error("next inbound sequence {next_in_after} must be greater than current {current}")]
     InvalidNextInbound { current: u64, next_in_after: u64 },
-    #[error("could not serialize audit event: {0}")]
-    AuditSerialization(String),
-    #[error("could not initialize audit HMAC")]
-    InvalidAuditKey,
-    #[error("audit chain verification failed at record {id}")]
-    AuditChainInvalid { id: u64 },
     #[error("request ID {0} is not present in the journal")]
     UnknownCommand(String),
     #[error("transmission ID {0} is not present in the journal")]
@@ -267,244 +249,29 @@ impl StoreWorker {
     }
 }
 
-pub struct MemoryStore {
-    audit_key: Vec<u8>,
-    recovery: RecoveryState,
-    commands: BTreeMap<String, CommandRecord>,
-    outbound: BTreeMap<u64, OutboundRecord>,
-    next_transmission: u64,
-    transmissions: BTreeMap<u64, TransmissionRecord>,
-    inbound: BTreeMap<u64, InboundRecord>,
-    events: BTreeMap<u64, EventRecord>,
-    audit: Vec<AuditRecord>,
-}
-
-impl MemoryStore {
-    #[must_use]
-    pub fn new(audit_key: &[u8]) -> Self {
-        Self {
-            audit_key: audit_key.to_vec(),
-            recovery: RecoveryState::default(),
-            commands: BTreeMap::new(),
-            outbound: BTreeMap::new(),
-            next_transmission: 1,
-            transmissions: BTreeMap::new(),
-            inbound: BTreeMap::new(),
-            events: BTreeMap::new(),
-            audit: Vec::new(),
-        }
-    }
-
-    #[must_use]
-    pub fn audit_records(&self) -> &[AuditRecord] {
-        &self.audit
-    }
-
-    #[must_use]
-    pub fn events(&self) -> Vec<&EventRecord> {
-        self.events.values().collect()
-    }
-
-    fn commit_outbound(&mut self, commit: OutboundCommit) -> Result<StoreReply, StoreError> {
-        if let Some(existing) = self.commands.get(&commit.request_id) {
-            if existing.fingerprint != commit.fingerprint {
-                return Err(StoreError::IdempotencyConflict {
-                    request_id: commit.request_id,
-                });
-            }
-            return Ok(StoreReply::Command(existing.clone()));
-        }
-        if commit.msg_seq_num != self.recovery.next_out {
-            return Err(StoreError::OutboundSequenceMismatch {
-                expected: self.recovery.next_out,
-                actual: commit.msg_seq_num,
-            });
-        }
-
-        let command = CommandRecord {
-            request_id: commit.request_id,
-            fingerprint: commit.fingerprint,
-            cl_ord_id: commit.cl_ord_id,
-            msg_seq_num: commit.msg_seq_num,
-            phase: CommandPhase::Journaled,
-        };
-        let audit = make_audit_record(&self.audit_key, self.audit.last(), commit.audit)?;
-
-        self.outbound.insert(
-            commit.msg_seq_num,
-            OutboundRecord {
-                command: command.clone(),
-                wire: commit.wire,
-            },
-        );
-        self.commands
-            .insert(command.request_id.clone(), command.clone());
-        self.recovery.next_out += 1;
-        self.audit.push(audit);
-
-        Ok(StoreReply::Command(command))
-    }
-
-    fn mark_outbound_written(
-        &mut self,
-        mark: MarkOutboundWritten,
-    ) -> Result<StoreReply, StoreError> {
-        let existing = self
-            .commands
-            .get(&mark.request_id)
-            .cloned()
-            .ok_or_else(|| StoreError::UnknownCommand(mark.request_id.clone()))?;
-        if existing.msg_seq_num != mark.msg_seq_num {
-            return Err(StoreError::OutboundSequenceMismatch {
-                expected: existing.msg_seq_num,
-                actual: mark.msg_seq_num,
-            });
-        }
-        let audit = make_audit_record(&self.audit_key, self.audit.last(), mark.audit)?;
-        let mut command = existing;
-        command.phase = CommandPhase::Written;
-
-        self.commands
-            .insert(command.request_id.clone(), command.clone());
-        let outbound = self
-            .outbound
-            .get_mut(&mark.msg_seq_num)
-            .ok_or_else(|| StoreError::UnknownCommand(mark.request_id.clone()))?;
-        outbound.command = command.clone();
-        self.audit.push(audit);
-
-        Ok(StoreReply::Command(command))
-    }
-
-    fn commit_transmission(
-        &mut self,
-        commit: TransmissionCommit,
-    ) -> Result<StoreReply, StoreError> {
-        let record = TransmissionRecord {
-            id: self.next_transmission,
-            msg_seq_num: commit.msg_seq_num,
-            kind: commit.kind,
-            wire: commit.wire,
-            phase: TransmissionPhase::Journaled,
-        };
-        let audit = make_audit_record(&self.audit_key, self.audit.last(), commit.audit)?;
-        self.transmissions.insert(record.id, record.clone());
-        self.next_transmission += 1;
-        self.audit.push(audit);
-        Ok(StoreReply::Transmission(record))
-    }
-
-    fn mark_transmission_written(
-        &mut self,
-        mark: MarkTransmissionWritten,
-    ) -> Result<StoreReply, StoreError> {
-        let mut record = self
-            .transmissions
-            .get(&mark.id)
-            .cloned()
-            .ok_or(StoreError::UnknownTransmission(mark.id))?;
-        let audit = make_audit_record(&self.audit_key, self.audit.last(), mark.audit)?;
-        record.phase = TransmissionPhase::Written;
-        self.transmissions.insert(record.id, record.clone());
-        self.audit.push(audit);
-        Ok(StoreReply::Transmission(record))
-    }
-
-    fn commit_inbound(&mut self, commit: InboundCommit) -> Result<StoreReply, StoreError> {
-        if commit.msg_seq_num != self.recovery.next_in {
-            return Err(StoreError::InboundSequenceMismatch {
-                expected: self.recovery.next_in,
-                actual: commit.msg_seq_num,
-            });
-        }
-        if commit.event.id != self.recovery.next_event {
-            return Err(StoreError::EventSequenceMismatch {
-                expected: self.recovery.next_event,
-                actual: commit.event.id,
-            });
-        }
-        if commit.next_in_after <= self.recovery.next_in {
-            return Err(StoreError::InvalidNextInbound {
-                current: self.recovery.next_in,
-                next_in_after: commit.next_in_after,
-            });
-        }
-
-        let record = InboundRecord {
-            msg_seq_num: commit.msg_seq_num,
-            msg_type: commit.msg_type,
-            wire: commit.wire,
-            event_id: commit.event.id,
-        };
-        let audit = make_audit_record(&self.audit_key, self.audit.last(), commit.audit)?;
-
-        self.inbound.insert(record.msg_seq_num, record.clone());
-        self.events.insert(commit.event.id, commit.event);
-        self.recovery.next_in = commit.next_in_after;
-        self.recovery.next_event += 1;
-        self.audit.push(audit);
-
-        Ok(StoreReply::Inbound(record))
-    }
-
-    fn load_outbound_range(&self, range: OutboundRange) -> StoreReply {
-        StoreReply::Outbound(
-            self.outbound
-                .range(range.begin..=range.end)
-                .map(|(_, record)| record.clone())
-                .collect(),
-        )
-    }
-
-    fn load_inbound(&self, sequence: u64) -> StoreReply {
-        StoreReply::StoredInbound(self.inbound.get(&sequence).cloned())
-    }
-
-    fn load_command(&self, request_id: &str) -> StoreReply {
-        StoreReply::StoredCommand(self.commands.get(request_id).cloned())
-    }
-
-    fn load_transmission(&self, id: u64) -> StoreReply {
-        StoreReply::StoredTransmission(self.transmissions.get(&id).cloned())
-    }
-}
-
-impl StorePort for MemoryStore {
-    fn recover(&mut self) -> Result<RecoveryState, StoreError> {
-        Ok(self.recovery.clone())
-    }
-
-    fn apply(&mut self, operation: StoreOp) -> Result<StoreReply, StoreError> {
-        match operation {
-            StoreOp::CommitOutbound(commit) => self.commit_outbound(commit),
-            StoreOp::MarkOutboundWritten(mark) => self.mark_outbound_written(mark),
-            StoreOp::CommitTransmission(commit) => self.commit_transmission(commit),
-            StoreOp::MarkTransmissionWritten(mark) => self.mark_transmission_written(mark),
-            StoreOp::CommitInbound(commit) => self.commit_inbound(commit),
-            StoreOp::LoadCommand(request_id) => Ok(self.load_command(&request_id)),
-            StoreOp::LoadOutboundRange(range) => Ok(self.load_outbound_range(range)),
-            StoreOp::LoadInbound(sequence) => Ok(self.load_inbound(sequence)),
-            StoreOp::LoadTransmission(id) => Ok(self.load_transmission(id)),
-        }
-    }
-}
-
 pub struct RedbStore {
     database: Database,
-    audit_key: Vec<u8>,
 }
 
 impl RedbStore {
-    pub fn open(path: impl AsRef<Path>, audit_key: &[u8]) -> Result<Self, StoreError> {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let database =
             Database::create(path).map_err(|error| StoreError::Backend(error.to_string()))?;
-        let store = Self {
-            database,
-            audit_key: audit_key.to_vec(),
-        };
+        let store = Self { database };
         store.initialize()?;
-        store.verify_audit_chain()?;
         Ok(store)
+    }
+
+    /// In-memory journal with the same semantics as [`RedbStore::open`];
+    /// nothing touches the disk. Intended for tests.
+    #[must_use]
+    pub fn open_in_memory() -> Self {
+        let database = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .expect("in-memory redb database must initialize");
+        let store = Self { database };
+        store.initialize().expect("in-memory store must initialize");
+        store
     }
 
     fn initialize(&self) -> Result<(), StoreError> {
@@ -533,14 +300,6 @@ impl RedbStore {
                 .is_none()
             {
                 meta.insert("next_in", 1)
-                    .map_err(|error| StoreError::Backend(error.to_string()))?;
-            }
-            if meta
-                .get("next_audit")
-                .map_err(|error| StoreError::Backend(error.to_string()))?
-                .is_none()
-            {
-                meta.insert("next_audit", 1)
                     .map_err(|error| StoreError::Backend(error.to_string()))?;
             }
             if meta
@@ -576,46 +335,8 @@ impl RedbStore {
             .open_table(EVENT_TABLE)
             .map_err(|error| StoreError::Backend(error.to_string()))?;
         transaction
-            .open_table(AUDIT_TABLE)
-            .map_err(|error| StoreError::Backend(error.to_string()))?;
-        transaction
             .commit()
             .map_err(|error| StoreError::Backend(error.to_string()))
-    }
-
-    fn verify_audit_chain(&self) -> Result<(), StoreError> {
-        let transaction = self
-            .database
-            .begin_read()
-            .map_err(|error| StoreError::Backend(error.to_string()))?;
-        let meta = transaction
-            .open_table(META_TABLE)
-            .map_err(|error| StoreError::Backend(error.to_string()))?;
-        let next_audit = meta
-            .get("next_audit")
-            .map_err(|error| StoreError::Backend(error.to_string()))?
-            .ok_or_else(|| StoreError::Decode("next_audit is missing".to_owned()))?
-            .value();
-        let audit = transaction
-            .open_table(AUDIT_TABLE)
-            .map_err(|error| StoreError::Backend(error.to_string()))?;
-        let mut previous = None::<AuditRecord>;
-
-        for id in 1..next_audit {
-            let record = audit
-                .get(id)
-                .map_err(|error| StoreError::Backend(error.to_string()))?
-                .ok_or(StoreError::AuditChainInvalid { id })?;
-            let record: AuditRecord = serde_json::from_slice(record.value())
-                .map_err(|_| StoreError::AuditChainInvalid { id })?;
-            let expected =
-                make_audit_record(&self.audit_key, previous.as_ref(), record.event.clone())?;
-            if record != expected {
-                return Err(StoreError::AuditChainInvalid { id });
-            }
-            previous = Some(record);
-        }
-        Ok(())
     }
 
     fn commit_outbound(&mut self, commit: OutboundCommit) -> Result<StoreReply, StoreError> {
@@ -647,21 +368,14 @@ impl RedbStore {
             return Ok(StoreReply::Command(existing));
         }
 
-        let (next_out, next_audit) = {
+        let next_out = {
             let meta = transaction
                 .open_table(META_TABLE)
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
-            let next_out = meta
-                .get("next_out")
+            meta.get("next_out")
                 .map_err(|error| StoreError::Backend(error.to_string()))?
                 .ok_or_else(|| StoreError::Decode("next_out is missing".to_owned()))?
-                .value();
-            let next_audit = meta
-                .get("next_audit")
-                .map_err(|error| StoreError::Backend(error.to_string()))?
-                .ok_or_else(|| StoreError::Decode("next_audit is missing".to_owned()))?
-                .value();
-            (next_out, next_audit)
+                .value()
         };
         if commit.msg_seq_num != next_out {
             return Err(StoreError::OutboundSequenceMismatch {
@@ -669,22 +383,6 @@ impl RedbStore {
                 actual: commit.msg_seq_num,
             });
         }
-
-        let previous_audit = if next_audit == 1 {
-            None
-        } else {
-            let audit = transaction
-                .open_table(AUDIT_TABLE)
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-            audit
-                .get(next_audit - 1)
-                .map_err(|error| StoreError::Backend(error.to_string()))?
-                .map(|record| {
-                    serde_json::from_slice::<AuditRecord>(record.value())
-                        .map_err(|error| StoreError::Decode(error.to_string()))
-                })
-                .transpose()?
-        };
 
         let command = CommandRecord {
             request_id: commit.request_id,
@@ -697,13 +395,10 @@ impl RedbStore {
             command: command.clone(),
             wire: commit.wire,
         };
-        let audit = make_audit_record(&self.audit_key, previous_audit.as_ref(), commit.audit)?;
         let command_bytes =
             serde_json::to_vec(&command).map_err(|error| StoreError::Decode(error.to_string()))?;
         let outbound_bytes =
             serde_json::to_vec(&outbound).map_err(|error| StoreError::Decode(error.to_string()))?;
-        let audit_bytes =
-            serde_json::to_vec(&audit).map_err(|error| StoreError::Decode(error.to_string()))?;
 
         {
             let mut commands = transaction
@@ -722,20 +417,10 @@ impl RedbStore {
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
         }
         {
-            let mut audit_table = transaction
-                .open_table(AUDIT_TABLE)
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-            audit_table
-                .insert(audit.id, audit_bytes.as_slice())
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-        }
-        {
             let mut meta = transaction
                 .open_table(META_TABLE)
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
             meta.insert("next_out", next_out + 1)
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-            meta.insert("next_audit", next_audit + 1)
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
         }
 
@@ -789,38 +474,12 @@ impl RedbStore {
         let mut outbound: OutboundRecord = serde_json::from_slice(&outbound_bytes)
             .map_err(|error| StoreError::Decode(error.to_string()))?;
 
-        let next_audit = {
-            let meta = transaction
-                .open_table(META_TABLE)
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-            meta.get("next_audit")
-                .map_err(|error| StoreError::Backend(error.to_string()))?
-                .ok_or_else(|| StoreError::Decode("next_audit is missing".to_owned()))?
-                .value()
-        };
-        let previous = {
-            let audit = transaction
-                .open_table(AUDIT_TABLE)
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-            audit
-                .get(next_audit - 1)
-                .map_err(|error| StoreError::Backend(error.to_string()))?
-                .map(|record| {
-                    serde_json::from_slice::<AuditRecord>(record.value())
-                        .map_err(|error| StoreError::Decode(error.to_string()))
-                })
-                .transpose()?
-        };
-
         command.phase = CommandPhase::Written;
         outbound.command = command.clone();
-        let audit = make_audit_record(&self.audit_key, previous.as_ref(), mark.audit)?;
         let command_bytes =
             serde_json::to_vec(&command).map_err(|error| StoreError::Decode(error.to_string()))?;
         let outbound_bytes =
             serde_json::to_vec(&outbound).map_err(|error| StoreError::Decode(error.to_string()))?;
-        let audit_bytes =
-            serde_json::to_vec(&audit).map_err(|error| StoreError::Decode(error.to_string()))?;
 
         {
             let mut commands = transaction
@@ -838,22 +497,6 @@ impl RedbStore {
                 .insert(mark.msg_seq_num, outbound_bytes.as_slice())
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
         }
-        {
-            let mut audit_table = transaction
-                .open_table(AUDIT_TABLE)
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-            audit_table
-                .insert(audit.id, audit_bytes.as_slice())
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-        }
-        {
-            let mut meta = transaction
-                .open_table(META_TABLE)
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-            meta.insert("next_audit", next_audit + 1)
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-        }
-
         transaction
             .commit()
             .map_err(|error| StoreError::Backend(error.to_string()))?;
@@ -872,36 +515,14 @@ impl RedbStore {
             .set_durability(Durability::Immediate)
             .map_err(|error| StoreError::Backend(error.to_string()))?;
 
-        let (next_transmission, next_audit) = {
+        let next_transmission = {
             let meta = transaction
                 .open_table(META_TABLE)
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
-            let next_transmission = meta
-                .get("next_transmission")
+            meta.get("next_transmission")
                 .map_err(|error| StoreError::Backend(error.to_string()))?
                 .ok_or_else(|| StoreError::Decode("next_transmission is missing".to_owned()))?
-                .value();
-            let next_audit = meta
-                .get("next_audit")
-                .map_err(|error| StoreError::Backend(error.to_string()))?
-                .ok_or_else(|| StoreError::Decode("next_audit is missing".to_owned()))?
-                .value();
-            (next_transmission, next_audit)
-        };
-        let previous = if next_audit == 1 {
-            None
-        } else {
-            let audit = transaction
-                .open_table(AUDIT_TABLE)
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-            audit
-                .get(next_audit - 1)
-                .map_err(|error| StoreError::Backend(error.to_string()))?
-                .map(|record| {
-                    serde_json::from_slice::<AuditRecord>(record.value())
-                        .map_err(|error| StoreError::Decode(error.to_string()))
-                })
-                .transpose()?
+                .value()
         };
         let record = TransmissionRecord {
             id: next_transmission,
@@ -910,11 +531,8 @@ impl RedbStore {
             wire: commit.wire,
             phase: TransmissionPhase::Journaled,
         };
-        let audit = make_audit_record(&self.audit_key, previous.as_ref(), commit.audit)?;
         let record_bytes =
             serde_json::to_vec(&record).map_err(|error| StoreError::Decode(error.to_string()))?;
-        let audit_bytes =
-            serde_json::to_vec(&audit).map_err(|error| StoreError::Decode(error.to_string()))?;
 
         {
             let mut transmissions = transaction
@@ -925,20 +543,10 @@ impl RedbStore {
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
         }
         {
-            let mut audit_table = transaction
-                .open_table(AUDIT_TABLE)
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-            audit_table
-                .insert(audit.id, audit_bytes.as_slice())
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-        }
-        {
             let mut meta = transaction
                 .open_table(META_TABLE)
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
             meta.insert("next_transmission", next_transmission + 1)
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-            meta.insert("next_audit", next_audit + 1)
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
         }
 
@@ -972,37 +580,10 @@ impl RedbStore {
         };
         let mut record: TransmissionRecord = serde_json::from_slice(&record_bytes)
             .map_err(|error| StoreError::Decode(error.to_string()))?;
-        let next_audit = {
-            let meta = transaction
-                .open_table(META_TABLE)
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-            meta.get("next_audit")
-                .map_err(|error| StoreError::Backend(error.to_string()))?
-                .ok_or_else(|| StoreError::Decode("next_audit is missing".to_owned()))?
-                .value()
-        };
-        let previous = if next_audit == 1 {
-            None
-        } else {
-            let audit = transaction
-                .open_table(AUDIT_TABLE)
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-            audit
-                .get(next_audit - 1)
-                .map_err(|error| StoreError::Backend(error.to_string()))?
-                .map(|record| {
-                    serde_json::from_slice::<AuditRecord>(record.value())
-                        .map_err(|error| StoreError::Decode(error.to_string()))
-                })
-                .transpose()?
-        };
 
         record.phase = TransmissionPhase::Written;
-        let audit = make_audit_record(&self.audit_key, previous.as_ref(), mark.audit)?;
         let record_bytes =
             serde_json::to_vec(&record).map_err(|error| StoreError::Decode(error.to_string()))?;
-        let audit_bytes =
-            serde_json::to_vec(&audit).map_err(|error| StoreError::Decode(error.to_string()))?;
 
         {
             let mut transmissions = transaction
@@ -1010,21 +591,6 @@ impl RedbStore {
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
             transmissions
                 .insert(record.id, record_bytes.as_slice())
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-        }
-        {
-            let mut audit_table = transaction
-                .open_table(AUDIT_TABLE)
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-            audit_table
-                .insert(audit.id, audit_bytes.as_slice())
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-        }
-        {
-            let mut meta = transaction
-                .open_table(META_TABLE)
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-            meta.insert("next_audit", next_audit + 1)
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
         }
 
@@ -1043,7 +609,7 @@ impl RedbStore {
             .set_durability(Durability::Immediate)
             .map_err(|error| StoreError::Backend(error.to_string()))?;
 
-        let (next_in, next_event, next_audit) = {
+        let (next_in, next_event) = {
             let meta = transaction
                 .open_table(META_TABLE)
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
@@ -1057,12 +623,7 @@ impl RedbStore {
                 .map_err(|error| StoreError::Backend(error.to_string()))?
                 .ok_or_else(|| StoreError::Decode("next_event is missing".to_owned()))?
                 .value();
-            let next_audit = meta
-                .get("next_audit")
-                .map_err(|error| StoreError::Backend(error.to_string()))?
-                .ok_or_else(|| StoreError::Decode("next_audit is missing".to_owned()))?
-                .value();
-            (next_in, next_event, next_audit)
+            (next_in, next_event)
         };
         if commit.msg_seq_num != next_in {
             return Err(StoreError::InboundSequenceMismatch {
@@ -1083,34 +644,16 @@ impl RedbStore {
             });
         }
 
-        let previous = if next_audit == 1 {
-            None
-        } else {
-            let audit = transaction
-                .open_table(AUDIT_TABLE)
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
-            audit
-                .get(next_audit - 1)
-                .map_err(|error| StoreError::Backend(error.to_string()))?
-                .map(|record| {
-                    serde_json::from_slice::<AuditRecord>(record.value())
-                        .map_err(|error| StoreError::Decode(error.to_string()))
-                })
-                .transpose()?
-        };
         let record = InboundRecord {
             msg_seq_num: commit.msg_seq_num,
             msg_type: commit.msg_type,
             wire: commit.wire,
             event_id: commit.event.id,
         };
-        let audit = make_audit_record(&self.audit_key, previous.as_ref(), commit.audit)?;
         let record_bytes =
             serde_json::to_vec(&record).map_err(|error| StoreError::Decode(error.to_string()))?;
         let event_bytes = serde_json::to_vec(&commit.event)
             .map_err(|error| StoreError::Decode(error.to_string()))?;
-        let audit_bytes =
-            serde_json::to_vec(&audit).map_err(|error| StoreError::Decode(error.to_string()))?;
 
         {
             let mut inbound = transaction
@@ -1129,11 +672,60 @@ impl RedbStore {
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
         }
         {
-            let mut audit_table = transaction
-                .open_table(AUDIT_TABLE)
+            let mut meta = transaction
+                .open_table(META_TABLE)
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
-            audit_table
-                .insert(audit.id, audit_bytes.as_slice())
+            meta.insert("next_in", commit.next_in_after)
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+            meta.insert("next_event", next_event + 1)
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+        }
+
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        Ok(StoreReply::Inbound(record))
+    }
+
+    fn resync_inbound(&mut self, commit: ResyncInboundCommit) -> Result<StoreReply, StoreError> {
+        let mut transaction = self
+            .database
+            .begin_write()
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        transaction
+            .set_durability(Durability::Immediate)
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+
+        let next_event = {
+            let meta = transaction
+                .open_table(META_TABLE)
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+            meta.get("next_event")
+                .map_err(|error| StoreError::Backend(error.to_string()))?
+                .ok_or_else(|| StoreError::Decode("next_event is missing".to_owned()))?
+                .value()
+        };
+        if commit.next_in_after == 0 {
+            return Err(StoreError::InvalidNextInbound {
+                current: 0,
+                next_in_after: 0,
+            });
+        }
+        if commit.event.id != next_event {
+            return Err(StoreError::EventSequenceMismatch {
+                expected: next_event,
+                actual: commit.event.id,
+            });
+        }
+
+        let event_bytes = serde_json::to_vec(&commit.event)
+            .map_err(|error| StoreError::Decode(error.to_string()))?;
+        {
+            let mut events = transaction
+                .open_table(EVENT_TABLE)
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+            events
+                .insert(commit.event.id, event_bytes.as_slice())
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
         }
         {
@@ -1144,14 +736,63 @@ impl RedbStore {
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
             meta.insert("next_event", next_event + 1)
                 .map_err(|error| StoreError::Backend(error.to_string()))?;
-            meta.insert("next_audit", next_audit + 1)
-                .map_err(|error| StoreError::Backend(error.to_string()))?;
         }
 
         transaction
             .commit()
             .map_err(|error| StoreError::Backend(error.to_string()))?;
-        Ok(StoreReply::Inbound(record))
+        Ok(StoreReply::ResyncedInbound(commit.next_in_after))
+    }
+
+    fn reset_sequences(&mut self) -> Result<StoreReply, StoreError> {
+        let mut transaction = self
+            .database
+            .begin_write()
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        transaction
+            .set_durability(Durability::Immediate)
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+
+        for definition in [OUTBOUND_TABLE, TRANSMISSION_TABLE, INBOUND_TABLE] {
+            let mut table = transaction
+                .open_table(definition)
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+            let keys: Vec<u64> = table
+                .iter()
+                .map_err(|error| StoreError::Backend(error.to_string()))?
+                .map(|entry| entry.map(|(key, _)| key.value()))
+                .collect::<Result<_, _>>()
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+            for key in keys {
+                table
+                    .remove(key)
+                    .map_err(|error| StoreError::Backend(error.to_string()))?;
+            }
+        }
+        let new_next_event = {
+            let mut meta = transaction
+                .open_table(META_TABLE)
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+            let next_event = meta
+                .get("next_event")
+                .map_err(|error| StoreError::Backend(error.to_string()))?
+                .ok_or_else(|| StoreError::Decode("next_event is missing".to_owned()))?
+                .value();
+            meta.insert("next_out", 1)
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+            meta.insert("next_in", 1)
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+            meta.insert("next_transmission", 1)
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+            meta.insert("next_event", next_event + 1)
+                .map_err(|error| StoreError::Backend(error.to_string()))?;
+            next_event + 1
+        };
+
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        Ok(StoreReply::SequencesReset(new_next_event))
     }
 
     fn load_outbound_range(&self, range: OutboundRange) -> Result<StoreReply, StoreError> {
@@ -1277,41 +918,12 @@ impl StorePort for RedbStore {
             StoreOp::CommitTransmission(commit) => self.commit_transmission(commit),
             StoreOp::MarkTransmissionWritten(mark) => self.mark_transmission_written(mark),
             StoreOp::CommitInbound(commit) => self.commit_inbound(commit),
+            StoreOp::ResyncInbound(commit) => self.resync_inbound(commit),
+            StoreOp::ResetSequences => self.reset_sequences(),
             StoreOp::LoadCommand(request_id) => self.load_command(&request_id),
             StoreOp::LoadOutboundRange(range) => self.load_outbound_range(range),
             StoreOp::LoadInbound(sequence) => self.load_inbound(sequence),
             StoreOp::LoadTransmission(id) => self.load_transmission(id),
         }
     }
-}
-
-fn make_audit_record(
-    key: &[u8],
-    previous: Option<&AuditRecord>,
-    event: AuditEvent,
-) -> Result<AuditRecord, StoreError> {
-    let previous_hash = previous.map_or_else(String::new, |record| record.hash.clone());
-    let event_bytes = serde_json::to_vec(&event)
-        .map_err(|error| StoreError::AuditSerialization(error.to_string()))?;
-    let mut mac = HmacSha256::new_from_slice(key).map_err(|_| StoreError::InvalidAuditKey)?;
-    mac.update(previous_hash.as_bytes());
-    mac.update(&event_bytes);
-    let hash = hex(&mac.finalize().into_bytes());
-
-    Ok(AuditRecord {
-        id: previous.map_or(1, |record| record.id + 1),
-        event,
-        previous_hash,
-        hash,
-    })
-}
-
-fn hex(input: &[u8]) -> String {
-    let mut output = String::with_capacity(input.len() * 2);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in input {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
 }

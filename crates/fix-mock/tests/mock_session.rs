@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use fix_mock::{MockConfig, run_mock_session};
-use fix_protocol::{Field, FrameDecoder, ParseDictionary, encode_message, parse_frame};
+use fix_protocol::{Field, FrameDecoder, encode_message, parse_frame};
 use fix_session::StaticTimeSource;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
@@ -40,8 +40,7 @@ async fn mock_logs_on_and_acknowledges_a_new_order_with_execution_report() {
         .expect("read server Logon");
     let mut decoder = FrameDecoder::new(16384);
     let server_logon = decoder.ingest(&bytes[..count]).expect("framed Logon");
-    let server_logon =
-        parse_frame(&server_logon[0], &ParseDictionary::new()).expect("parsed Logon");
+    let server_logon = parse_frame(&server_logon[0]).expect("parsed Logon");
     assert_eq!(server_logon.msg_type(), Some(b"A".as_slice()));
 
     let order = encode_message(
@@ -68,7 +67,7 @@ async fn mock_logs_on_and_acknowledges_a_new_order_with_execution_report() {
         .expect("ExecutionReport timeout")
         .expect("read ExecutionReport");
     let reports = decoder.ingest(&bytes[..count]).expect("framed report");
-    let report = parse_frame(&reports[0], &ParseDictionary::new()).expect("parsed report");
+    let report = parse_frame(&reports[0]).expect("parsed report");
 
     assert_eq!(report.msg_type(), Some(b"8".as_slice()));
     assert_eq!(report.values(11).next(), Some(b"FC-ORDER-1".as_slice()));

@@ -1,11 +1,6 @@
 use fix_control::SessionSlot;
-use fix_protocol::{
-    CompiledDictionary, Field, FrameDecoder, MemberDefinition, MessageDefinition, ParseDictionary,
-    ParsedMessage, encode_message, parse_frame,
-};
-use fix_store::{MemoryStore, StoreWorker};
-use fixd::{SessionConfigFile, TransportConfig, TransportSecurity, run_connection_manager};
-use std::sync::Arc;
+use fix_protocol::{Field, FrameDecoder, ParsedMessage, encode_message, parse_frame};
+use fixd::{SessionConfigFile, TransportConfig, run_connection_manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, timeout};
@@ -20,7 +15,6 @@ async fn connection_manager_reconnects_with_persisted_sequences_after_transport_
         TransportConfig {
             host: address.ip().to_string(),
             port: address.port(),
-            security: TransportSecurity::PlaintextCert,
             connect_timeout_ms: 250,
             reconnect_initial_ms: 10,
             reconnect_max_ms: 40,
@@ -30,13 +24,12 @@ async fn connection_manager_reconnects_with_persisted_sequences_after_transport_
             sender_comp_id: "CLIENT".to_owned(),
             target_comp_id: "SERVER".to_owned(),
             heartbeat_interval_secs: 30,
-            default_appl_ver_id: None,
-            logon_fields_file: None,
+            reset_on_logon: false,
         },
-        Arc::new(logon_dictionary()),
         Vec::new(),
-        StoreWorker::spawn(MemoryStore::new(b"reconnect-audit-key")),
+        test_store(),
         SessionSlot::new(),
+        fix_session::SessionLogger::disabled(),
     ));
 
     let (mut first, _) = timeout(Duration::from_secs(2), listener.accept())
@@ -74,7 +67,7 @@ async fn read_message(stream: &mut TcpStream) -> ParsedMessage {
             .into_iter()
             .next()
         {
-            return parse_frame(&frame, &ParseDictionary::new()).expect("parse FIX message");
+            return parse_frame(&frame).expect("parse FIX message");
         }
     }
 }
@@ -96,17 +89,10 @@ fn server_logon(sequence: u64) -> Vec<u8> {
     .to_vec()
 }
 
-fn logon_dictionary() -> CompiledDictionary {
-    CompiledDictionary::new("FIX.4.4").with_message(MessageDefinition {
-        name: "Logon".to_owned(),
-        msg_type: "A".to_owned(),
-        members: vec![
-            MemberDefinition::field(49, true),
-            MemberDefinition::field(56, true),
-            MemberDefinition::field(34, true),
-            MemberDefinition::field(52, true),
-            MemberDefinition::field(98, true),
-            MemberDefinition::field(108, true),
-        ],
-    })
+fn test_store() -> fix_store::StoreHandle {
+    fix_store::StoreWorker::spawn(test_redb())
+}
+
+fn test_redb() -> fix_store::RedbStore {
+    fix_store::RedbStore::open_in_memory()
 }

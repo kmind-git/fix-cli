@@ -5,7 +5,6 @@ use fix_protocol::Field;
 use fix_session::{ApplicationRequest, SessionError, SessionHandle, SessionPhase, SessionStatus};
 use fix_store::{CommandRecord, StoreHandle, StoreOp, StoreReply};
 use rust_decimal::Decimal;
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, VecDeque};
@@ -14,7 +13,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionMode {
     Inspect,
@@ -29,7 +28,7 @@ pub enum RuntimeMode {
     Live,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LiveAuth {
     pub key_id: String,
     pub unix_ms: u64,
@@ -37,7 +36,7 @@ pub struct LiveAuth {
     pub mac_hex: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ControlRequest {
     pub version: u32,
@@ -48,7 +47,7 @@ pub struct ControlRequest {
     pub auth: Option<LiveAuth>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     SessionStatus,
@@ -58,31 +57,50 @@ pub enum Command {
     ReplaceOrder(ReplaceOrder),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NewOrderSingle {
     pub symbol: String,
+    pub account: String,
+    pub security_exchange: String,
+    pub security_group: String,
     pub side: Side,
     pub quantity: String,
     #[serde(rename = "ord_type")]
     pub order_type: OrderType,
     pub price: Option<String>,
     pub time_in_force: TimeInForce,
+    /// 200 MaturityMonthYear for futures contracts, e.g. "202609".
+    #[serde(default)]
+    pub maturity_month_year: Option<String>,
+    /// Extra (tag, value) pairs appended verbatim, e.g. venue-specific
+    /// tags like [[16013, "SGHB"], [16095, "0"]].
+    #[serde(default)]
+    pub extra_tags: Vec<(u32, String)>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CancelOrder {
-    pub original_request_id: String,
-    pub symbol: String,
-    pub side: Side,
+    /// request_id of the original order; planner derives its ClOrdID.
+    #[serde(default)]
+    pub original_request_id: Option<String>,
+    /// The target order's ClOrdID (tag 11) as seen on the wire, used
+    /// directly as OrigClOrdID(41). Exactly one of the two id fields.
+    #[serde(default)]
+    pub cl_ord_id: Option<String>,
+    pub account: String,
+    pub security_group: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ReplaceOrder {
     pub original_request_id: String,
     pub symbol: String,
+    pub account: Option<String>,
+    pub security_exchange: Option<String>,
+    pub security_group: Option<String>,
     pub side: Side,
     pub quantity: String,
     #[serde(rename = "ord_type")]
@@ -91,21 +109,21 @@ pub struct ReplaceOrder {
     pub time_in_force: TimeInForce,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Side {
     Buy,
     Sell,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderType {
     Market,
     Limit,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TimeInForce {
     Day,
@@ -116,7 +134,6 @@ pub enum TimeInForce {
 
 #[derive(Clone, Debug)]
 pub struct Policy {
-    pub allowed_symbols: BTreeSet<String>,
     pub max_quantity: Decimal,
     pub max_notional: Decimal,
     pub allow_market_orders: bool,
@@ -127,7 +144,6 @@ impl Policy {
     #[must_use]
     pub fn deny_all() -> Self {
         Self {
-            allowed_symbols: BTreeSet::new(),
             max_quantity: Decimal::ZERO,
             max_notional: Decimal::ZERO,
             allow_market_orders: false,
@@ -178,19 +194,36 @@ impl CommandPlanner {
             }
             Command::NewOrderSingle(order) => {
                 let normalized = self.validate_order(
-                    &order.symbol,
                     order.quantity.as_str(),
                     order.order_type,
                     order.price.as_deref(),
                 )?;
-                let fields = vec![
+                let mut fields = vec![
+                    Field::new(1, Bytes::copy_from_slice(order.account.as_bytes())),
                     Field::new(21, Bytes::from_static(b"1")),
+                    Field::new(
+                        207,
+                        Bytes::copy_from_slice(order.security_exchange.as_bytes()),
+                    ),
+                    Field::new(
+                        1151,
+                        Bytes::copy_from_slice(order.security_group.as_bytes()),
+                    ),
                     Field::new(55, Bytes::copy_from_slice(order.symbol.as_bytes())),
                     Field::new(54, Bytes::from_static(side_code(order.side))),
                     Field::new(38, Bytes::from(normalized.quantity)),
                     Field::new(40, Bytes::from_static(order_type_code(order.order_type))),
                 ];
-                let fields = append_price_and_tif(fields, normalized.price, order.time_in_force);
+                if let Some(maturity) = &order.maturity_month_year {
+                    validate_tag_value(200, maturity)?;
+                    fields.push(Field::new(200, Bytes::copy_from_slice(maturity.as_bytes())));
+                }
+                let fields = append_tif_then_price(fields, normalized.price, order.time_in_force);
+                let mut fields = fields;
+                for (tag, value) in &order.extra_tags {
+                    validate_extra_tag(*tag, value)?;
+                    fields.push(Field::new(*tag, Bytes::copy_from_slice(value.as_bytes())));
+                }
                 Ok(PlannedCommand::Application(ApplicationRequest {
                     request_id: request.request_id.clone(),
                     fingerprint: fingerprint(request, "D", &fields),
@@ -200,14 +233,32 @@ impl CommandPlanner {
                 }))
             }
             Command::CancelOrder(cancel) => {
-                self.validate_symbol(&cancel.symbol)?;
+                let orig_cl_ord_id = match (&cancel.original_request_id, &cancel.cl_ord_id) {
+                    (Some(request_id), None) => cl_ord_id(&self.profile, request_id),
+                    (None, Some(cl_ord_id)) => {
+                        if cl_ord_id.is_empty() || cl_ord_id.len() > 64 {
+                            return Err(ControlError::invalid("cl_ord_id is empty or too long"));
+                        }
+                        cl_ord_id.clone()
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(ControlError::invalid(
+                            "provide either original_request_id or cl_ord_id, not both",
+                        ));
+                    }
+                    (None, None) => {
+                        return Err(ControlError::invalid(
+                            "cancel requires original_request_id or cl_ord_id",
+                        ));
+                    }
+                };
                 let fields = vec![
+                    Field::new(41, Bytes::from(orig_cl_ord_id)),
+                    Field::new(1, Bytes::copy_from_slice(cancel.account.as_bytes())),
                     Field::new(
-                        41,
-                        Bytes::from(cl_ord_id(&self.profile, &cancel.original_request_id)),
+                        1151,
+                        Bytes::copy_from_slice(cancel.security_group.as_bytes()),
                     ),
-                    Field::new(55, Bytes::copy_from_slice(cancel.symbol.as_bytes())),
-                    Field::new(54, Bytes::from_static(side_code(cancel.side))),
                 ];
                 Ok(PlannedCommand::Application(ApplicationRequest {
                     request_id: request.request_id.clone(),
@@ -219,22 +270,34 @@ impl CommandPlanner {
             }
             Command::ReplaceOrder(replace) => {
                 let normalized = self.validate_order(
-                    &replace.symbol,
                     replace.quantity.as_str(),
                     replace.order_type,
                     replace.price.as_deref(),
                 )?;
-                let fields = vec![
-                    Field::new(
-                        41,
-                        Bytes::from(cl_ord_id(&self.profile, &replace.original_request_id)),
-                    ),
-                    Field::new(55, Bytes::copy_from_slice(replace.symbol.as_bytes())),
-                    Field::new(54, Bytes::from_static(side_code(replace.side))),
-                    Field::new(38, Bytes::from(normalized.quantity)),
-                    Field::new(40, Bytes::from_static(order_type_code(replace.order_type))),
-                ];
-                let fields = append_price_and_tif(fields, normalized.price, replace.time_in_force);
+                let mut fields = vec![Field::new(
+                    41,
+                    Bytes::from(cl_ord_id(&self.profile, &replace.original_request_id)),
+                )];
+                if let Some(account) = &replace.account {
+                    fields.push(Field::new(1, Bytes::copy_from_slice(account.as_bytes())));
+                }
+                if let Some(exchange) = &replace.security_exchange {
+                    fields.push(Field::new(207, Bytes::copy_from_slice(exchange.as_bytes())));
+                }
+                if let Some(group) = &replace.security_group {
+                    fields.push(Field::new(1151, Bytes::copy_from_slice(group.as_bytes())));
+                }
+                fields.push(Field::new(
+                    55,
+                    Bytes::copy_from_slice(replace.symbol.as_bytes()),
+                ));
+                fields.push(Field::new(54, Bytes::from_static(side_code(replace.side))));
+                fields.push(Field::new(38, Bytes::from(normalized.quantity)));
+                fields.push(Field::new(
+                    40,
+                    Bytes::from_static(order_type_code(replace.order_type)),
+                ));
+                let fields = append_tif_then_price(fields, normalized.price, replace.time_in_force);
                 Ok(PlannedCommand::Application(ApplicationRequest {
                     request_id: request.request_id.clone(),
                     fingerprint: fingerprint(request, "G", &fields),
@@ -295,12 +358,10 @@ impl CommandPlanner {
 
     fn validate_order(
         &self,
-        symbol: &str,
         quantity: &str,
         order_type: OrderType,
         price: Option<&str>,
     ) -> Result<NormalizedOrder, ControlError> {
-        self.validate_symbol(symbol)?;
         let quantity = positive_decimal(quantity, "quantity")?;
         if quantity > self.policy.max_quantity {
             return Err(ControlError::policy(
@@ -308,20 +369,12 @@ impl CommandPlanner {
             ));
         }
 
-        let price = match (order_type, price) {
-            (OrderType::Limit, Some(price)) => Some(positive_decimal(price, "price")?),
-            (OrderType::Limit, None) => {
-                return Err(ControlError::invalid("limit order requires price"));
-            }
-            (OrderType::Market, Some(_)) => {
-                return Err(ControlError::invalid("market order must not include price"));
-            }
-            (OrderType::Market, None) => {
-                return Err(ControlError::policy(
-                    "market orders are unsupported until a bounded reference-price policy is implemented",
-                ));
-            }
-        };
+        let price = price
+            .map(|price| positive_decimal(price, "price"))
+            .transpose()?;
+        if matches!(order_type, OrderType::Limit) && price.is_none() {
+            return Err(ControlError::invalid("limit order requires price"));
+        }
 
         if let Some(price) = price {
             let notional = quantity
@@ -338,13 +391,6 @@ impl CommandPlanner {
             quantity: quantity.normalize().to_string(),
             price: price.map(|price| price.normalize().to_string()),
         })
-    }
-
-    fn validate_symbol(&self, symbol: &str) -> Result<(), ControlError> {
-        if !self.policy.allowed_symbols.contains(symbol) {
-            return Err(ControlError::policy("symbol is not allowed"));
-        }
-        Ok(())
     }
 }
 
@@ -419,25 +465,55 @@ fn order_type_code(order_type: OrderType) -> &'static [u8] {
 
 fn time_in_force_code(time_in_force: TimeInForce) -> &'static [u8] {
     match time_in_force {
-        TimeInForce::Day => b"0",
+        // ponytail: Hundsun's dictionary wants literal "DAY" (standard FIX is
+        // "0" and the venue Rejects 59=0 as out-of-range). Other venues =>
+        // dictionary-aware mapping.
+        TimeInForce::Day => b"DAY",
         TimeInForce::Gtc => b"1",
         TimeInForce::Ioc => b"3",
         TimeInForce::Fok => b"4",
     }
 }
 
-fn append_price_and_tif(
+fn validate_extra_tag(tag: u32, value: &str) -> Result<(), ControlError> {
+    const MANAGED: [u32; 22] = [
+        1, 8, 9, 10, 11, 21, 34, 35, 38, 40, 41, 44, 49, 52, 54, 55, 56, 58, 59, 60, 1151, 200,
+    ];
+    if MANAGED.contains(&tag) {
+        return Err(ControlError::invalid(format!(
+            "extra tag {tag} is managed by the order schema"
+        )));
+    }
+    validate_tag_value(tag, value)
+}
+
+fn validate_tag_value(tag: u32, value: &str) -> Result<(), ControlError> {
+    if tag == 0
+        || value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b'=')
+    {
+        return Err(ControlError::invalid(format!(
+            "tag {tag} value is empty, too long, or not safe ASCII"
+        )));
+    }
+    Ok(())
+}
+
+fn append_tif_then_price(
     mut fields: Vec<Field>,
     price: Option<String>,
     time_in_force: TimeInForce,
 ) -> Vec<Field> {
-    if let Some(price) = price {
-        fields.push(Field::new(44, Bytes::from(price)));
-    }
     fields.push(Field::new(
         59,
         Bytes::from_static(time_in_force_code(time_in_force)),
     ));
+    if let Some(price) = price {
+        fields.push(Field::new(44, Bytes::from(price)));
+    }
     fields
 }
 
@@ -483,11 +559,7 @@ fn hex(input: &[u8]) -> String {
 }
 
 #[must_use]
-pub fn control_request_schema() -> schemars::Schema {
-    schemars::schema_for!(ControlRequest)
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ControlResponse {
     pub version: u32,
     pub request_id: String,
@@ -498,7 +570,7 @@ pub struct ControlResponse {
     pub error: Option<ControlErrorBody>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ControlErrorBody {
     pub code: String,
     pub retryable: bool,
@@ -573,11 +645,6 @@ impl SessionSlot {
 }
 
 impl ControlService {
-    #[must_use]
-    pub fn new(planner: CommandPlanner, session: SessionHandle) -> Self {
-        Self::new_dynamic(planner, SessionSlot::with_session(session))
-    }
-
     #[must_use]
     pub fn new_dynamic(planner: CommandPlanner, sessions: SessionSlot) -> Self {
         Self::build(planner, sessions, None)

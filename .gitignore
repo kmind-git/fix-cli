@@ -4,5 +4,9 @@
 .env.*
 *.log
 /data/
-/secrets/*
-!/secrets/*.example
+/orders/
+# 真实交易环境配置，含账号密码，勿入库
+/config/CLIENT.CFG
+/config/audit.key
+/SubConf.xml
+/logs/

@@ -9,9 +9,10 @@ license.workspace = true
 bytes.workspace = true
 fix-protocol = { path = "../fix-protocol" }
 fix-store = { path = "../fix-store" }
+rust_decimal.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-time.workspace = true
+time = { workspace = true, features = ["formatting", "macros", "local-offset"] }
 tokio.workspace = true
 
 [lints]

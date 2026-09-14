@@ -1,15 +1,12 @@
 use bytes::Bytes;
 use fix_control::{
     Command, CommandPlanner, ControlRequest, ControlService, ExecutionMode, NewOrderSingle,
-    OrderType, Policy, RuntimeMode, Side, TimeInForce,
+    OrderType, Policy, RuntimeMode, SessionSlot, Side, TimeInForce,
 };
 use fix_protocol::{Field, encode_message};
 use fix_session::{SessionConfig, SessionPhase, StaticTimeSource, spawn_initiator};
-use fix_store::{
-    MemoryStore, RecoveryState, StoreError, StoreOp, StorePort, StoreReply, StoreWorker,
-};
+use fix_store::{RecoveryState, StoreError, StoreOp, StorePort, StoreReply};
 use rust_decimal::Decimal;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
@@ -26,10 +23,10 @@ async fn certification_orders_are_rejected_when_the_policy_rate_is_exhausted() {
             sender_comp_id: "CLIENT".to_owned(),
             target_comp_id: "SERVER".to_owned(),
             heartbeat_interval_secs: 30,
-            default_appl_ver_id: None,
+            reset_on_logon: false,
         },
-        StoreWorker::spawn(CountApplicationCommits {
-            inner: MemoryStore::new(b"rate-limit-audit-key"),
+        fix_store::StoreWorker::spawn(CountApplicationCommits {
+            inner: test_redb(),
             commits: Arc::clone(&application_commits),
         }),
         Arc::new(StaticTimeSource::new("20260726-15:00:00.000")),
@@ -63,7 +60,7 @@ async fn certification_orders_are_rejected_when_the_policy_rate_is_exhausted() {
     })
     .await
     .expect("establish timeout");
-    let service = ControlService::new(planner(), session);
+    let service = ControlService::new_dynamic(planner(), SessionSlot::with_session(session));
 
     let (first, concurrent_retry) = tokio::join!(
         service.execute(order("rate-order-1")),
@@ -120,9 +117,9 @@ async fn a_not_established_submit_releases_its_rate_reservation() {
             sender_comp_id: "CLIENT".to_owned(),
             target_comp_id: "SERVER".to_owned(),
             heartbeat_interval_secs: 30,
-            default_appl_ver_id: None,
+            reset_on_logon: false,
         },
-        StoreWorker::spawn(MemoryStore::new(b"rate-refund-audit-key")),
+        test_store(),
         Arc::new(StaticTimeSource::new("20260726-15:00:00.000")),
     );
     let mut bytes = vec![0_u8; 16 * 1024];
@@ -130,7 +127,8 @@ async fn a_not_established_submit_releases_its_rate_reservation() {
         .await
         .expect("outbound Logon timeout")
         .expect("read outbound Logon");
-    let service = ControlService::new(planner(), session.clone());
+    let service =
+        ControlService::new_dynamic(planner(), SessionSlot::with_session(session.clone()));
 
     let rejected = service.execute(order("pre-logon-order")).await;
 
@@ -182,7 +180,6 @@ fn planner() -> CommandPlanner {
         "rate-test",
         RuntimeMode::Certification,
         Policy {
-            allowed_symbols: BTreeSet::from(["IBM".to_owned()]),
             max_quantity: Decimal::from(1_000),
             max_notional: Decimal::from(1_000_000),
             allow_market_orders: false,
@@ -192,7 +189,7 @@ fn planner() -> CommandPlanner {
 }
 
 struct CountApplicationCommits {
-    inner: MemoryStore,
+    inner: fix_store::RedbStore,
     commits: Arc<AtomicUsize>,
 }
 
@@ -220,12 +217,25 @@ fn order(request_id: &str) -> ControlRequest {
         execution_mode: ExecutionMode::Certification,
         command: Command::NewOrderSingle(NewOrderSingle {
             symbol: "IBM".to_owned(),
+            account: "110853".to_owned(),
+            security_exchange: "XSGE".to_owned(),
+            security_group: "FUT".to_owned(),
             side: Side::Buy,
             quantity: "10".to_owned(),
             order_type: OrderType::Limit,
             price: Some("100".to_owned()),
             time_in_force: TimeInForce::Day,
+            maturity_month_year: None,
+            extra_tags: Vec::new(),
         }),
         auth: None,
     }
+}
+
+fn test_store() -> fix_store::StoreHandle {
+    fix_store::StoreWorker::spawn(test_redb())
+}
+
+fn test_redb() -> fix_store::RedbStore {
+    fix_store::RedbStore::open_in_memory()
 }

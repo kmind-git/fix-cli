@@ -1,13 +1,14 @@
 #![forbid(unsafe_code)]
 
 use bytes::Bytes;
-use fix_protocol::{
-    Field, FrameDecoder, ParseDictionary, ParsedMessage, encode_message, parse_frame,
-};
+use fix_protocol::{Field, FrameDecoder, ParsedMessage, encode_message, parse_frame};
 use fix_session::TimeSource;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+pub use fix_session::SessionLogger;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MockConfig {
@@ -32,9 +33,21 @@ pub enum MockError {
 }
 
 pub async fn run_mock_session<T>(
+    io: T,
+    config: MockConfig,
+    time_source: Arc<dyn TimeSource>,
+) -> Result<(), MockError>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    run_mock_session_logged(io, config, time_source, &SessionLogger::disabled()).await
+}
+
+pub async fn run_mock_session_logged<T>(
     mut io: T,
     config: MockConfig,
     time_source: Arc<dyn TimeSource>,
+    logger: &SessionLogger,
 ) -> Result<(), MockError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -44,68 +57,105 @@ where
     let mut next_in = 1_u64;
     let mut next_out = 1_u64;
     let mut next_execution_id = 1_u64;
+    let heartbeat_interval = Duration::from_secs(config.heartbeat_interval_secs.max(1));
+    let mut established = false;
+    let mut last_outbound = tokio::time::Instant::now();
 
     loop {
-        let count = io
-            .read(&mut input)
-            .await
-            .map_err(|error| MockError::Transport(error.to_string()))?;
-        if count == 0 {
-            return Ok(());
-        }
-
-        let frames = decoder
-            .ingest(&input[..count])
-            .map_err(|error| MockError::Frame(error.to_string()))?;
-        for frame in frames {
-            let message = parse_frame(&frame, &ParseDictionary::new())
-                .map_err(|error| MockError::Parse(error.to_string()))?;
-            validate_envelope(&message, &config, next_in)?;
-            next_in = next_in
-                .checked_add(1)
-                .ok_or_else(|| MockError::Protocol("inbound sequence overflow".to_owned()))?;
-
-            let msg_type = required(&message, 35)?;
-            let response = match msg_type {
-                b"A" => Some(logon_fields(&config, &*time_source, next_out)),
-                b"0" => None,
-                b"1" => Some(heartbeat_fields(
-                    &config,
-                    &*time_source,
-                    next_out,
-                    message.values(112).next(),
-                )),
-                b"D" | b"F" | b"G" => {
-                    let fields = execution_report_fields(
-                        &config,
-                        &*time_source,
-                        next_out,
-                        next_execution_id,
-                        &message,
-                    )?;
-                    next_execution_id = next_execution_id.checked_add(1).ok_or_else(|| {
-                        MockError::Protocol("execution identifier overflow".to_owned())
-                    })?;
-                    Some(fields)
-                }
-                b"5" => {
-                    let fields = logout_fields(&config, &*time_source, next_out);
-                    write_message(&mut io, &config.begin_string, &fields).await?;
+        tokio::select! {
+            count = io.read(&mut input) => {
+                let count = count
+                    .map_err(|error| MockError::Transport(error.to_string()))?;
+                if count == 0 {
                     return Ok(());
                 }
-                value => {
-                    return Err(MockError::Protocol(format!(
-                        "unsupported MsgType {}",
-                        String::from_utf8_lossy(value)
-                    )));
-                }
-            };
 
-            if let Some(fields) = response {
-                write_message(&mut io, &config.begin_string, &fields).await?;
-                next_out = next_out
-                    .checked_add(1)
-                    .ok_or_else(|| MockError::Protocol("outbound sequence overflow".to_owned()))?;
+                let frames = decoder
+                    .ingest(&input[..count])
+                    .map_err(|error| MockError::Frame(error.to_string()))?;
+                for frame in frames {
+                    logger.incoming(&frame);
+                    let message = parse_frame(&frame)
+                        .map_err(|error| MockError::Parse(error.to_string()))?;
+                    if let Err(error) = validate_envelope(&message, &config, next_in) {
+                        logger.info(format!("rejecting message: {error}"));
+                        return Err(error);
+                    }
+                    next_in = next_in
+                        .checked_add(1)
+                        .ok_or_else(|| MockError::Protocol("inbound sequence overflow".to_owned()))?;
+
+                    let msg_type = required(&message, 35)?;
+                    let response = match msg_type {
+                        b"A" => {
+                            logger.info("Received logon request");
+                            logger.info("Responding to logon request");
+                            established = true;
+                            let mut fields = logon_fields(&config, &*time_source, next_out);
+                            if message.values(141).next() == Some(b"Y".as_slice()) {
+                                fields.push(Field::new(141, Bytes::from_static(b"Y")));
+                            }
+                            Some(fields)
+                        }
+                        b"0" => None,
+                        b"1" => Some(heartbeat_fields(
+                            &config,
+                            &*time_source,
+                            next_out,
+                            message.values(112).next(),
+                        )),
+                        b"D" | b"F" | b"G" => {
+                            let fields = execution_report_fields(
+                                &config,
+                                &*time_source,
+                                next_out,
+                                next_execution_id,
+                                &message,
+                            )?;
+                            next_execution_id = next_execution_id.checked_add(1).ok_or_else(|| {
+                                MockError::Protocol("execution identifier overflow".to_owned())
+                            })?;
+                            Some(fields)
+                        }
+                        b"5" => {
+                            logger.info("Received logout request");
+                            logger.info("Sending logout response");
+                            let fields = logout_fields(&config, &*time_source, next_out);
+                            write_message(&mut io, &config.begin_string, &fields, logger).await?;
+                            return Ok(());
+                        }
+                        value => {
+                            let error = MockError::Protocol(format!(
+                                "unsupported MsgType {}",
+                                String::from_utf8_lossy(value)
+                            ));
+                            logger.error(format!("{error}"));
+                            return Err(error);
+                        }
+                    };
+
+                    if let Some(fields) = response {
+                        write_message(&mut io, &config.begin_string, &fields, logger).await?;
+                        next_out = next_out
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                MockError::Protocol("outbound sequence overflow".to_owned())
+                            })?;
+                        last_outbound = tokio::time::Instant::now();
+                    }
+                }
+            }
+            // Sleep until the exact heartbeat due point; recomputed after
+            // every send so gaps never exceed the interval.
+            _ = tokio::time::sleep_until(last_outbound + heartbeat_interval) => {
+                if established {
+                    let fields = heartbeat_fields(&config, &*time_source, next_out, None);
+                    write_message(&mut io, &config.begin_string, &fields, logger).await?;
+                    next_out = next_out
+                        .checked_add(1)
+                        .ok_or_else(|| MockError::Protocol("outbound sequence overflow".to_owned()))?;
+                    last_outbound = tokio::time::Instant::now();
+                }
             }
         }
     }
@@ -170,8 +220,6 @@ fn execution_report_fields(
 ) -> Result<Vec<Field>, MockError> {
     let request_type = required(request, 35)?;
     let cl_ord_id = required(request, 11)?;
-    let symbol = required(request, 55)?;
-    let side = required(request, 54)?;
     let order_qty = request.values(38).next().unwrap_or(b"0");
     let (exec_type, order_status, leaves_qty) = match request_type {
         b"D" => (b"0".as_slice(), b"0".as_slice(), order_qty),
@@ -186,20 +234,25 @@ fn execution_report_fields(
     let mut fields = standard_header(config, time_source, sequence, "8");
     fields.extend([
         Field::new(37, Bytes::from(format!("MOCK-ORDER-{execution_id}"))),
-        Field::new(17, Bytes::from(format!("MOCK-EXEC-{execution_id}"))),
-        Field::new(150, Bytes::copy_from_slice(exec_type)),
-        Field::new(39, Bytes::copy_from_slice(order_status)),
         Field::new(11, Bytes::copy_from_slice(cl_ord_id)),
     ]);
     if let Some(orig_cl_ord_id) = request.values(41).next() {
         fields.push(Field::new(41, Bytes::copy_from_slice(orig_cl_ord_id)));
     }
     fields.extend([
-        Field::new(55, Bytes::copy_from_slice(symbol)),
-        Field::new(54, Bytes::copy_from_slice(side)),
+        Field::new(17, Bytes::from(format!("MOCK-EXEC-{execution_id}"))),
+        Field::new(39, Bytes::copy_from_slice(order_status)),
+        Field::new(150, Bytes::copy_from_slice(exec_type)),
+    ]);
+    if let Some(symbol) = request.values(55).next() {
+        fields.push(Field::new(55, Bytes::copy_from_slice(symbol)));
+    }
+    if let Some(side) = request.values(54).next() {
+        fields.push(Field::new(54, Bytes::copy_from_slice(side)));
+    }
+    fields.extend([
         Field::new(151, Bytes::copy_from_slice(leaves_qty)),
         Field::new(14, Bytes::from_static(b"0")),
-        Field::new(6, Bytes::from_static(b"0")),
     ]);
     Ok(fields)
 }
@@ -219,12 +272,18 @@ fn standard_header(
     ]
 }
 
-async fn write_message<T>(io: &mut T, begin_string: &str, fields: &[Field]) -> Result<(), MockError>
+async fn write_message<T>(
+    io: &mut T,
+    begin_string: &str,
+    fields: &[Field],
+    logger: &SessionLogger,
+) -> Result<(), MockError>
 where
     T: AsyncWrite + Unpin,
 {
     let wire = encode_message(begin_string.as_bytes(), fields)
         .map_err(|error| MockError::Encode(error.to_string()))?;
+    logger.outgoing(&wire);
     io.write_all(&wire)
         .await
         .map_err(|error| MockError::Transport(error.to_string()))?;

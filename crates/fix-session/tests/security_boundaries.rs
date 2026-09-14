@@ -1,16 +1,14 @@
 use bytes::Bytes;
 use fix_protocol::{Field, encode_message};
 use fix_session::{SessionConfig, SessionEvent, SessionPhase, StaticTimeSource, spawn_initiator};
-use fix_store::{
-    MemoryStore, RecoveryState, StoreError, StoreOp, StorePort, StoreReply, StoreWorker,
-};
+use fix_store::{RecoveryState, StoreError, StoreOp, StorePort, StoreReply};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::time::{Duration, timeout};
 
 #[derive(Clone)]
 struct SharedStore {
-    inner: Arc<Mutex<MemoryStore>>,
+    inner: Arc<Mutex<fix_store::RedbStore>>,
 }
 
 impl StorePort for SharedStore {
@@ -31,12 +29,12 @@ impl StorePort for SharedStore {
 
 #[tokio::test]
 async fn invalid_logon_heartbeat_is_rejected_before_inbound_commit() {
-    let shared = Arc::new(Mutex::new(MemoryStore::new(b"semantic-audit-key")));
+    let shared = Arc::new(Mutex::new(test_redb()));
     let (session, mut peer) = duplex(8192);
     let handle = spawn_initiator(
         session,
         config(),
-        StoreWorker::spawn(SharedStore {
+        fix_store::StoreWorker::spawn(SharedStore {
             inner: Arc::clone(&shared),
         }),
         Arc::new(StaticTimeSource::new("20260726-15:00:00.000")),
@@ -65,12 +63,12 @@ async fn invalid_logon_heartbeat_is_rejected_before_inbound_commit() {
 
 #[tokio::test]
 async fn inbound_sensitive_fields_are_rejected_before_persistence() {
-    let shared = Arc::new(Mutex::new(MemoryStore::new(b"sensitive-audit-key")));
+    let shared = Arc::new(Mutex::new(test_redb()));
     let (session, mut peer) = duplex(8192);
     let handle = spawn_initiator(
         session,
         config(),
-        StoreWorker::spawn(SharedStore {
+        fix_store::StoreWorker::spawn(SharedStore {
             inner: Arc::clone(&shared),
         }),
         Arc::new(StaticTimeSource::new("20260726-15:00:00.000")),
@@ -102,12 +100,12 @@ async fn inbound_sensitive_fields_are_rejected_before_persistence() {
 
 #[tokio::test]
 async fn invalid_resend_range_is_rejected_before_inbound_commit() {
-    let shared = Arc::new(Mutex::new(MemoryStore::new(b"resend-audit-key")));
+    let shared = Arc::new(Mutex::new(test_redb()));
     let (session, mut peer) = duplex(8192);
     let handle = spawn_initiator(
         session,
         config(),
-        StoreWorker::spawn(SharedStore {
+        fix_store::StoreWorker::spawn(SharedStore {
             inner: Arc::clone(&shared),
         }),
         Arc::new(StaticTimeSource::new("20260726-15:00:00.000")),
@@ -168,7 +166,7 @@ fn config() -> SessionConfig {
         sender_comp_id: "CLIENT".to_owned(),
         target_comp_id: "SERVER".to_owned(),
         heartbeat_interval_secs: 30,
-        default_appl_ver_id: None,
+        reset_on_logon: false,
     }
 }
 
@@ -206,4 +204,8 @@ async fn next_protocol_error(
     })
     .await
     .expect("protocol error timeout")
+}
+
+fn test_redb() -> fix_store::RedbStore {
+    fix_store::RedbStore::open_in_memory()
 }

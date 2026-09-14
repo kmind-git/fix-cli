@@ -1,5 +1,8 @@
 {
   "symbol": "IBM",
+  "account": "110853",
+  "security_exchange": "XSGE",
+  "security_group": "FUT",
   "side": "buy",
   "quantity": "100",
   "ord_type": "limit",

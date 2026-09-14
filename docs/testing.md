@@ -34,10 +34,9 @@ cargo run --locked -p fix-fuzz -- --seed 4354685564936845355 --cases 10000 --max
 4. PossDup 正常重放、OrigSendingTime 错误、payload 篡改、未知旧序号。
 5. D/F/G 字段顺序、价格/数量精度、拒单、部分成交、完全成交、取消、改单。
 6. socket 半包、粘包、慢读、突然 EOF、连接拒绝、重连抖动。
-7. daemon kill/restart、journaled-but-not-written、redb reopen、错误审计 key。
-8. Orchestra 字典哈希不匹配、未知 MsgType、缺少 required tag、错误 repeating group count。
-9. 超限数量/名义金额/市场单、symbol allowlist、速率上限、幂等冲突。
-10. 对手方正式 certification script 和结果归档。
+7. daemon kill/restart、journaled-but-not-written、redb reopen。
+8. 超限数量/名义金额/市场单、速率上限、幂等冲突。
+9. 对手方正式 certification script 和结果归档。
 
 ## 尚未执行
 
